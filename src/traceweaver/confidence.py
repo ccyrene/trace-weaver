@@ -22,6 +22,9 @@ TASK_DEPENDENCY = HIGH
 # recognised only by a URI / file-path pattern.
 CONNECTION = LOW
 PATTERN = LOW
+# Operation-level inference: the KIND of source/sink is read from a library
+# call (pandas/boto3/SQLAlchemy/hook) even though the exact name is runtime-built.
+OPERATION = LOW
 
 
 def sql_confidence(*, high_confidence: bool, paired: bool) -> str:

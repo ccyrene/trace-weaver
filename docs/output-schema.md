@@ -31,11 +31,22 @@
 | task_id | Task ID |
 | source_dataset | Source dataset candidate |
 | target_dataset | Target dataset candidate |
-| extraction_method | sqlglot, sql_regex, dataset_pattern, conn_id |
+| extraction_method | sqlglot, sql_regex, dataset_pattern, conn_id, operation |
 | confidence | high, medium, low |
 
 Confidence guide: `high` = sqlglot-parsed SQL; `medium` = regex-parsed SQL or a
-fully paired source→target; `low` = single-sided heuristic (URI/conn/file hint).
+fully paired source→target; `low` = single-sided heuristic (URI/conn/file hint)
+or an `operation` inference.
+
+`operation` edges are **coarse, operation-level** lineage: when a task does I/O
+through library calls (e.g. `pd.read_csv("s3://…")`, `df.to_sql("schema.tbl")`,
+`create_engine(...)`, boto3 `put_object`) rather than operator keyword
+arguments, the exact path is often built at runtime and unresolvable
+statically. TraceWeaver still infers the *kind* of source/sink from the call and
+emits a half-edge, attributed to the owning task through the function-call graph
+(so I/O in a cross-file helper is credited to the task that calls it). Dataset
+names are the resolved value when literal (e.g. `schema.tbl` from `to_sql`) or a
+coarse `type:format` label otherwise (e.g. `s3:csv`, `s3:parquet`).
 
 ## task_dependencies.csv
 

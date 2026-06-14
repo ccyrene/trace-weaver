@@ -48,8 +48,12 @@ class TestMermaidExporter(unittest.TestCase):
 
     def test_labels_dag_and_tasks(self):
         self.assertIn('"DAG: g"', self.graph)  # DAG name in subgraph title
-        self.assertIn("<b>a</b>", self.graph)  # task card titles (bold)
-        self.assertIn("<b>t</b>", self.graph)
+        # Task names appear as plain text (no <b>/<i>, which break wherever
+        # Mermaid runs with htmlLabels off — e.g. GitHub, VS Code).
+        self.assertIn("a<br/>calls:", self.graph)  # task 'a' card + its calls
+        self.assertIn('["t"]', self.graph)  # task 't' (no calls) as a plain node
+        self.assertNotIn("<b>", self.graph)
+        self.assertNotIn("<i>", self.graph)
 
     def test_node_shapes_and_classes(self):
         self.assertIn('[("in.t")]', self.graph)  # table -> cylinder
@@ -60,7 +64,7 @@ class TestMermaidExporter(unittest.TestCase):
 
     def test_calls_listed_inside_card_not_as_edges(self):
         # Functions are listed inside the task card, not drawn as separate nodes.
-        self.assertIn("<i>calls:</i>", self.graph)
+        self.assertIn("calls:", self.graph)
         self.assertIn("1. helper", self.graph)
         self.assertNotIn(" -. calls .-> ", self.graph)
         self.assertNotIn('(["helper"])', self.graph)
