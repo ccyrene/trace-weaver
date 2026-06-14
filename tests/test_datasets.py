@@ -37,5 +37,39 @@ class TestDatasetExtraction(unittest.TestCase):
         self.assertEqual(ds.name, "warehouse")
 
 
+class TestTableExtraction(unittest.TestCase):
+    def test_qualified_table(self):
+        ds = datasets_from_text("analytics.orders")
+        self.assertEqual(len(ds), 1)
+        self.assertEqual(ds[0].dataset_type, "table")
+        self.assertEqual(ds[0].schema_name, "analytics")
+        self.assertEqual(ds[0].table_name, "orders")
+
+    def test_db_schema_table(self):
+        ds = datasets_from_text("warehouse.public.events")
+        self.assertEqual(ds[0].dataset_type, "table")
+        self.assertEqual(ds[0].schema_name, "public")
+        self.assertEqual(ds[0].table_name, "events")
+
+    def test_filenames_are_not_tables(self):
+        # A data file is a 'file'; code/config/.sql files are not datasets.
+        self.assertEqual(datasets_from_text("orders.csv")[0].dataset_type, "file")
+        for s in ("config.yaml", "module.py", "queries/load.sql"):
+            types = {d.dataset_type for d in datasets_from_text(s)}
+            self.assertNotIn("table", types, s)
+
+    def test_unqualified_word_is_not_a_table(self):
+        self.assertEqual(datasets_from_text("orders"), [])
+
+    def test_too_many_parts_is_not_a_table(self):
+        # Anything beyond db.schema.table is treated as a non-table dotted path.
+        self.assertEqual(datasets_from_text("a.b.c.d"), [])
+
+    def test_table_not_matched_inside_prose(self):
+        # Whole-string only: a dotted token embedded in text is not a table.
+        types = {d.dataset_type for d in datasets_from_text("see analytics.orders now")}
+        self.assertNotIn("table", types)
+
+
 if __name__ == "__main__":
     unittest.main()
