@@ -52,6 +52,61 @@ _FILE_EXT_TYPES = {
     "xlsx": "file",
 }
 
+# A bare ``schema.table`` (or ``db.schema.table``) reference: 2-3 dotted SQL
+# identifiers and nothing else. Anchored to the whole string so we only treat a
+# string literal that *is* a qualified table name as a dataset — never a dotted
+# substring inside prose, a URL host, or an attribute access.
+TABLE_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*){1,2}")
+
+# Trailing segments that mean the dotted string is a filename / module / config
+# reference rather than a ``schema.table`` (prevents e.g. ``orders.csv``,
+# ``config.yaml``, ``module.py``, ``queries.load.sql`` becoming phantom tables).
+_NON_TABLE_TAILS = {
+    # data files (already handled as 'file' datasets)
+    "csv",
+    "tsv",
+    "json",
+    "jsonl",
+    "parquet",
+    "orc",
+    "avro",
+    "xls",
+    "xlsx",
+    # code / config / docs / archives
+    "py",
+    "pyc",
+    "ipynb",
+    "sql",
+    "sh",
+    "txt",
+    "md",
+    "rst",
+    "yaml",
+    "yml",
+    "cfg",
+    "ini",
+    "conf",
+    "env",
+    "toml",
+    "lock",
+    "html",
+    "xml",
+    "log",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "pdf",
+    "gz",
+    "zip",
+    "tar",
+    "j2",
+    "jinja",
+    "tmpl",
+    "template",
+}
+
 
 def datasets_from_text(text: str) -> list[Dataset]:
     """Return dataset candidates found inside a single string literal.
@@ -84,7 +139,33 @@ def datasets_from_text(text: str) -> list[Dataset]:
             Dataset(name=name, dataset_type=_FILE_EXT_TYPES.get(ext, "file"), uri=name)
         )
 
+    table = _table_from_text(text)
+    if table is not None:
+        datasets.append(table)
+
     return datasets
+
+
+def _table_from_text(text: str) -> Dataset | None:
+    """Return a ``schema.table`` Dataset when the whole string is one.
+
+    Returns ``None`` for filenames, module paths, URIs, and anything that is not
+    a clean qualified table reference.
+    """
+    candidate = text.strip()
+    if "://" in candidate or "/" in candidate:
+        return None
+    if TABLE_RE.fullmatch(candidate) is None:
+        return None
+    parts = candidate.split(".")
+    if parts[-1].lower() in _NON_TABLE_TAILS:
+        return None
+    return Dataset(
+        name=candidate,
+        dataset_type="table",
+        schema_name=parts[-2] if len(parts) >= 2 else None,
+        table_name=parts[-1],
+    )
 
 
 def connection_dataset(conn_id: str) -> Dataset:

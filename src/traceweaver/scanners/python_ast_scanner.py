@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 from traceweaver.models import (
@@ -64,6 +65,22 @@ class PythonAstScanner:
                 result.datasets.extend(datasets)
                 result.edges.extend(edges)
 
+        # SQL stored in external .sql files referenced by an operator
+        # (e.g. PostgresOperator(sql="sql/load_orders.sql")).
+        for (dag_id, task_id), refs in visitor.sql_files_by_task.items():
+            for sql_path, operator_class in refs:
+                content, warning = self._read_repo_sql_file(sql_path, rel_path)
+                if warning:
+                    result.warnings.append(warning)
+                if not content:
+                    continue
+                dialect = dialect_for_operator(operator_class)
+                datasets, edges, _backend = extract_sql_lineage(
+                    content, dag_id=dag_id, task_id=task_id, dialect=dialect
+                )
+                result.datasets.extend(datasets)
+                result.edges.extend(edges)
+
         result.function_calls.extend(
             self._attribute_function_calls(visitor.function_calls, visitor.jobs)
         )
@@ -115,6 +132,51 @@ class PythonAstScanner:
                 attributed.append(call)
         return attributed
 
+    def _read_repo_sql_file(
+        self, sql_path: str, current_rel: str
+    ) -> tuple[str | None, str | None]:
+        """Read an external .sql file referenced from a DAG, if it resolves.
+
+        Returns ``(content, warning)``. Tries the path relative to the repo root
+        and to the referencing DAG file first. The basename fallback is only
+        used when it is *unambiguous* (exactly one file with that name in the
+        repo); when several match we refuse to guess — picking the wrong file
+        would attribute incorrect lineage silently — and return a warning
+        instead. All reads are confined to the repo tree (no path traversal).
+        """
+        repo_root = self.repo_root.resolve()
+        rel = Path(sql_path)
+        candidates = [repo_root / rel, (repo_root / current_rel).parent / rel]
+        for candidate in candidates:
+            text = self._read_if_within(candidate, repo_root)
+            if text is not None:
+                return text, None
+        # Basename fallback, only when there is no ambiguity.
+        matches = [m for m in sorted(repo_root.rglob(rel.name)) if m.is_file()]
+        if len(matches) == 1:
+            return self._read_if_within(matches[0], repo_root), None
+        if len(matches) > 1:
+            return None, (
+                f"Ambiguous .sql reference {sql_path!r}: {len(matches)} files "
+                "share that name under the repo; skipped (cannot pick one)."
+            )
+        return None, None
+
+    @staticmethod
+    def _read_if_within(path: Path, repo_root: Path) -> str | None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return None
+        if resolved != repo_root and repo_root not in resolved.parents:
+            return None  # outside the scanned repo — refuse to read
+        if not resolved.is_file():
+            return None
+        try:
+            return resolved.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
     def _module_name(self, file_path: Path) -> str:
         try:
             rel = file_path.relative_to(self.repo_root).with_suffix("")
@@ -138,6 +200,9 @@ class _DagAstVisitor(ast.NodeVisitor):
 
         # task_id keyed sql, with the operator class so we can pick a dialect.
         self.sql_by_task: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
+        # task_id keyed references to external ``.sql`` files (resolved + read
+        # by PythonAstScanner, which knows the repo root).
+        self.sql_files_by_task: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
 
         # Resolution tables populated during the prescan.
         self.dag_var_to_id: dict[str, str] = {}
@@ -358,12 +423,66 @@ class _DagAstVisitor(ast.NodeVisitor):
     def _collect_sql(
         self, call: ast.Call, dag_id: str, task_id: str, operator_class: str
     ) -> None:
+        seen: set[str] = set()
+        # Top-level operator keyword arguments (sql=, query=, ...).
         for key in _SQL_KEYS:
-            sql = self._get_keyword_string(call, key)
-            if sql and self._looks_like_sql(sql):
-                self.sql_by_task.setdefault((dag_id, task_id), []).append(
-                    (sql, operator_class)
-                )
+            value = self._get_keyword_string(call, key)
+            if value:
+                self._route_sql_value(value, dag_id, task_id, operator_class, seen)
+        # SQL nested inside config dicts/lists, e.g. op_kwargs={"sql": ...} or
+        # BigQueryInsertJobOperator(configuration={"query": {"query": ...}}).
+        for node in [*call.args, *(kw.value for kw in call.keywords)]:
+            if isinstance(node, (ast.Dict, ast.List, ast.Tuple)):
+                for value in self._iter_dict_sql(node):
+                    self._route_sql_value(value, dag_id, task_id, operator_class, seen)
+
+    def _route_sql_value(
+        self,
+        value: str,
+        dag_id: str,
+        task_id: str,
+        operator_class: str,
+        seen: set[str],
+    ) -> None:
+        """Send a discovered string to inline-SQL or external-.sql-file buckets."""
+        if value in seen:
+            return
+        if self._looks_like_sql(value):
+            seen.add(value)
+            self.sql_by_task.setdefault((dag_id, task_id), []).append(
+                (value, operator_class)
+            )
+        elif self._is_sql_file_ref(value):
+            seen.add(value)
+            self.sql_files_by_task.setdefault((dag_id, task_id), []).append(
+                (value.strip(), operator_class)
+            )
+
+    def _iter_dict_sql(self, node: ast.AST, depth: int = 0):
+        """Yield string literals stored under SQL-named keys in nested dicts."""
+        if depth > 5:
+            return
+        if isinstance(node, ast.Dict):
+            for key_node, value_node in zip(node.keys, node.values):
+                key = self._literal_string(key_node) if key_node is not None else None
+                if key and key.lower() in _SQL_KEYS:
+                    text = self._literal_string(value_node)
+                    if text:
+                        yield text
+                yield from self._iter_dict_sql(value_node, depth + 1)
+        elif isinstance(node, (ast.List, ast.Tuple)):
+            for element in node.elts:
+                yield from self._iter_dict_sql(element, depth + 1)
+
+    @staticmethod
+    def _is_sql_file_ref(value: str) -> bool:
+        """True for a string that names an external ``.sql`` file to load."""
+        token = value.strip()
+        return (
+            token.lower().endswith(".sql")
+            and "\n" not in token
+            and bool(re.fullmatch(r"[\w./\-]+", token))
+        )
 
     def _collect_connection_ids(
         self, call: ast.Call, dag_id: str, task_id: str

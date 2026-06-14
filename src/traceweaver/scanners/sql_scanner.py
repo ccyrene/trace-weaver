@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 
+from traceweaver import confidence
 from traceweaver.models import Dataset, LineageEdge
 
 _TABLE = r"[A-Za-z_][\w$]*(?:\.[A-Za-z_][\w$]*){0,2}"
@@ -93,8 +94,8 @@ def build_lineage(
     """
     datasets = [dataset_from_table(name) for name in sorted(sources | targets)]
 
-    paired = "high" if high_confidence else "medium"
-    half = "medium" if high_confidence else "low"
+    paired = confidence.sql_confidence(high_confidence=high_confidence, paired=True)
+    half = confidence.sql_confidence(high_confidence=high_confidence, paired=False)
 
     edges: list[LineageEdge] = []
     if sources and targets:
