@@ -108,12 +108,18 @@ _NON_TABLE_TAILS = {
 }
 
 
-def datasets_from_text(text: str) -> list[Dataset]:
+def datasets_from_text(text: str, detect_tables: bool = True) -> list[Dataset]:
     """Return dataset candidates found inside a single string literal.
 
     A URI like ``s3://bucket/orders.csv`` is reported once (as its scheme
     type) rather than double-counted as both an ``s3`` dataset and a bare
     ``file`` dataset.
+
+    ``detect_tables`` controls the bare ``schema.table`` heuristic. It is safe
+    for callers with dataset intent (an operator path/key kwarg) but too greedy
+    for arbitrary string literals — values like an Airflow ``owner`` of
+    ``"first.last"`` would otherwise be misread as a table — so the blanket
+    constant scan passes ``detect_tables=False``.
     """
     datasets: list[Dataset] = []
     matched_spans: list[tuple[int, int]] = []
@@ -139,9 +145,10 @@ def datasets_from_text(text: str) -> list[Dataset]:
             Dataset(name=name, dataset_type=_FILE_EXT_TYPES.get(ext, "file"), uri=name)
         )
 
-    table = _table_from_text(text)
-    if table is not None:
-        datasets.append(table)
+    if detect_tables:
+        table = _table_from_text(text)
+        if table is not None:
+            datasets.append(table)
 
     return datasets
 

@@ -79,6 +79,9 @@ class ScanResult:
     task_dependencies: list[TaskDependency] = field(default_factory=list)
     function_calls: list[FunctionCall] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Transient: raw operation-level accesses awaiting task attribution by
+    # RepoScanner. Converted into datasets/edges there, never serialized.
+    io_accesses: list = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +103,7 @@ class ScanResult:
         self.task_dependencies.extend(other.task_dependencies)
         self.function_calls.extend(other.function_calls)
         self.warnings.extend(other.warnings)
+        self.io_accesses.extend(other.io_accesses)
 
     def dedupe(self) -> None:
         self.jobs = list(dict.fromkeys(self.jobs))

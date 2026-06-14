@@ -13,6 +13,7 @@ from traceweaver.models import (
     TaskDependency,
 )
 from traceweaver.scanners.datasets import connection_dataset, datasets_from_text
+from traceweaver.scanners.operations import IoAccess, describe_io
 from traceweaver.scanners.sql_lineage import dialect_for_operator, extract_sql_lineage
 
 # Operator-style call suffixes that we treat as Airflow tasks.
@@ -84,6 +85,9 @@ class PythonAstScanner:
         result.function_calls.extend(
             self._attribute_function_calls(visitor.function_calls, visitor.jobs)
         )
+        # Raw operation accesses are attributed to tasks at the repo level (the
+        # call graph that links a task to its helper functions can span files).
+        result.io_accesses.extend(visitor.io_accesses)
 
         result.dedupe()
         return result
@@ -197,6 +201,9 @@ class _DagAstVisitor(ast.NodeVisitor):
         self.edges: list[LineageEdge] = []
         self.task_dependencies: list[TaskDependency] = []
         self.function_calls: list[FunctionCall] = []
+        # Coarse data accesses inferred from library calls; resolved to tasks by
+        # RepoScanner once the whole-repo call graph is available.
+        self.io_accesses: list[IoAccess] = []
 
         # task_id keyed sql, with the operator class so we can pick a dialect.
         self.sql_by_task: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
@@ -331,6 +338,15 @@ class _DagAstVisitor(ast.NodeVisitor):
                         line_no=getattr(node, "lineno", None),
                     )
                 )
+
+            # Coarse, operation-level data access (pd.read_csv, df.to_sql,
+            # boto3 put_object, create_engine, ...). Attributed to a task later
+            # by RepoScanner via the call graph.
+            if self.current_function:
+                access = describe_io(node, self._literal_string)
+                if access is not None:
+                    access.caller_function = self.current_function
+                    self.io_accesses.append(access)
 
             # TaskFlow invocation: extract_orders().
             if call_name in self.decorated_task_functions and self.dag_stack:
@@ -796,7 +812,10 @@ class _DagAstVisitor(ast.NodeVisitor):
         )
 
     def _record_datasets(self, text: str) -> None:
-        for dataset in datasets_from_text(text):
+        # No bare schema.table detection here: an arbitrary string constant
+        # (e.g. an Airflow ``owner`` like "first.last") is not a dataset. URIs
+        # and data-file paths are still high-signal and stay on.
+        for dataset in datasets_from_text(text, detect_tables=False):
             self.datasets.append(dataset)
             # Only attribute a free-standing string literal to a task when it
             # lives inside a real function body. Operator keyword strings are
