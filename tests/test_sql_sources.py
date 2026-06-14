@@ -39,6 +39,50 @@ class TestExternalSqlFile(unittest.TestCase):
         )
         self.assertIn(("raw.orders", "analytics.orders_clean"), _pairs(result))
 
+    def test_unresolved_path_uses_unambiguous_basename_fallback(self):
+        # The sql= path does not resolve directly, but exactly one file with
+        # that basename exists in the repo, so it is found.
+        result = _scan(
+            {
+                "etl/queries/load.sql": (
+                    "INSERT INTO analytics.orders_clean SELECT * FROM raw.orders\n"
+                ),
+                "dag.py": (
+                    "from airflow import DAG\n"
+                    "from airflow.providers.postgres.operators.postgres "
+                    "import PostgresOperator\n"
+                    'with DAG(dag_id="d") as dag:\n'
+                    '    PostgresOperator(task_id="t", sql="load.sql")\n'
+                ),
+            }
+        )
+        self.assertIn(("raw.orders", "analytics.orders_clean"), _pairs(result))
+
+    def test_ambiguous_basename_is_skipped_with_warning(self):
+        # Two files share the basename and neither resolves directly: refuse to
+        # guess, emit a warning, and produce no (possibly wrong) lineage.
+        result = _scan(
+            {
+                "a/load.sql": "INSERT INTO a.t SELECT * FROM a.src\n",
+                "b/load.sql": "INSERT INTO b.t SELECT * FROM b.src\n",
+                "dag.py": (
+                    "from airflow import DAG\n"
+                    "from airflow.providers.postgres.operators.postgres "
+                    "import PostgresOperator\n"
+                    'with DAG(dag_id="d") as dag:\n'
+                    '    PostgresOperator(task_id="t", sql="load.sql")\n'
+                ),
+            }
+        )
+        sql_methods = {"sqlglot", "sql_regex"}
+        self.assertEqual(
+            [e for e in result.edges if e.extraction_method in sql_methods], []
+        )
+        self.assertTrue(
+            any("Ambiguous .sql reference" in w for w in result.warnings),
+            result.warnings,
+        )
+
     def test_missing_sql_file_is_ignored_gracefully(self):
         result = _scan(
             {

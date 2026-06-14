@@ -69,7 +69,9 @@ class PythonAstScanner:
         # (e.g. PostgresOperator(sql="sql/load_orders.sql")).
         for (dag_id, task_id), refs in visitor.sql_files_by_task.items():
             for sql_path, operator_class in refs:
-                content = self._read_repo_sql_file(sql_path, rel_path)
+                content, warning = self._read_repo_sql_file(sql_path, rel_path)
+                if warning:
+                    result.warnings.append(warning)
                 if not content:
                     continue
                 dialect = dialect_for_operator(operator_class)
@@ -130,12 +132,17 @@ class PythonAstScanner:
                 attributed.append(call)
         return attributed
 
-    def _read_repo_sql_file(self, sql_path: str, current_rel: str) -> str | None:
-        """Read an external .sql file referenced from a DAG, if it exists.
+    def _read_repo_sql_file(
+        self, sql_path: str, current_rel: str
+    ) -> tuple[str | None, str | None]:
+        """Read an external .sql file referenced from a DAG, if it resolves.
 
-        Tries the path relative to the repo root and to the referencing DAG
-        file, then falls back to a basename search anywhere under the repo. All
-        reads are confined to the repo tree (no path traversal).
+        Returns ``(content, warning)``. Tries the path relative to the repo root
+        and to the referencing DAG file first. The basename fallback is only
+        used when it is *unambiguous* (exactly one file with that name in the
+        repo); when several match we refuse to guess — picking the wrong file
+        would attribute incorrect lineage silently — and return a warning
+        instead. All reads are confined to the repo tree (no path traversal).
         """
         repo_root = self.repo_root.resolve()
         rel = Path(sql_path)
@@ -143,12 +150,17 @@ class PythonAstScanner:
         for candidate in candidates:
             text = self._read_if_within(candidate, repo_root)
             if text is not None:
-                return text
-        for match in sorted(repo_root.rglob(rel.name)):
-            text = self._read_if_within(match, repo_root)
-            if text is not None:
-                return text
-        return None
+                return text, None
+        # Basename fallback, only when there is no ambiguity.
+        matches = [m for m in sorted(repo_root.rglob(rel.name)) if m.is_file()]
+        if len(matches) == 1:
+            return self._read_if_within(matches[0], repo_root), None
+        if len(matches) > 1:
+            return None, (
+                f"Ambiguous .sql reference {sql_path!r}: {len(matches)} files "
+                "share that name under the repo; skipped (cannot pick one)."
+            )
+        return None, None
 
     @staticmethod
     def _read_if_within(path: Path, repo_root: Path) -> str | None:
