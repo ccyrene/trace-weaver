@@ -52,7 +52,7 @@ Extracted from explicit ordering (`>>`, `<<`, list fan-out, `chain(...)`,
 argument passing (a task receiving another task's output as an argument) →
 `taskflow_data`.
 
-## lineage.mmd / lineage.md (Mermaid)
+## lineage.mmd (Mermaid)
 
 A single Mermaid `flowchart LR` rendering of the scan, written by
 `--output mermaid` (and `--output all`):
@@ -66,11 +66,10 @@ A single Mermaid `flowchart LR` rendering of the scan, written by
   connections → hexagons `{{name}}`; edges are thin (`-->`), dotted (`-.->`)
   when confidence is `low`.
 
-`lineage.md` wraps the same graph in a ```mermaid fence for instant viewing on
-GitHub/GitLab/VS Code; `lineage.mmd` is the raw graph for mermaid-cli /
-mermaid.live. With `--image-format svg|png|both` (the Docker image bundles
-mermaid-cli and defaults to `both`) TraceWeaver also writes rendered
-`lineage.svg` / `lineage.png`.
+`lineage.mmd` is the raw graph for mermaid-cli / mermaid.live (paste it at
+<https://mermaid.live> or render it locally). With `--image-format svg|png|both`
+(the `Dockerfile.render` image bundles mermaid-cli and defaults to `both`)
+TraceWeaver also writes rendered `lineage.svg` / `lineage.png` alongside it.
 
 ## function_calls.csv
 
