@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 import hashlib
 
+from traceweaver import confidence as _confidence
+
 
 @dataclass(frozen=True)
 class LineageJob:
@@ -53,7 +55,7 @@ class TaskDependency:
     upstream_task_id: str
     downstream_task_id: str
     extraction_method: str = "static_ast"
-    confidence: str = "high"
+    confidence: str = _confidence.TASK_DEPENDENCY
 
 
 @dataclass(frozen=True)
