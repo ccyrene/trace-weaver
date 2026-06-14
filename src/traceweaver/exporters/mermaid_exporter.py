@@ -40,10 +40,16 @@ def _escape(label: str) -> str:
 
 
 def _card_label(task: str, functions: list[str]) -> str:
-    """A task card: bold title, then a numbered list of the functions it calls."""
-    rows = [f"<b>{_escape(task)}</b>"]
+    """A task card: the task name, then a numbered list of the functions it calls.
+
+    Plain text with ``<br/>`` line breaks only -- no ``<b>``/``<i>``. Those
+    render as literal tags wherever Mermaid runs with ``htmlLabels`` off (GitHub,
+    VS Code, and other embedded viewers), turning the card into unreadable
+    markup; ``<br/>`` is honoured in both modes.
+    """
+    rows = [_escape(task)]
     if functions:
-        rows.append("<i>calls:</i>")
+        rows.append("calls:")
         rows += [f"{i}. {_escape(fn)}" for i, fn in enumerate(functions, 1)]
     return "<br/>".join(rows)
 
