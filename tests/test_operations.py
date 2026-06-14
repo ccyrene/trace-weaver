@@ -111,6 +111,37 @@ class TestOperationLineageAttribution(unittest.TestCase):
         self.assertIn(("s3:csv", None), op_edges)  # read
         self.assertIn((None, "analytics.orders"), op_edges)  # write
 
+    def test_ambiguous_function_name_is_not_misattributed(self):
+        # Two modules define `run`; only b.run does the I/O, and the task calls
+        # a.run (no I/O). A bare-name call graph would wrongly link the S3 read
+        # to the task — instead it must be skipped (ambiguous) with a warning.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "mod_a.py").write_text("def run():\n    return 1\n")
+            (root / "mod_b.py").write_text(
+                "import pandas as pd\n"
+                "def run():\n"
+                "    return pd.read_csv('s3://bucket/x.csv')\n"
+            )
+            (root / "flow.py").write_text(
+                "from airflow.decorators import dag, task\n"
+                "from mod_a import run\n"
+                '@dag(dag_id="d")\n'
+                "def d():\n"
+                "    @task\n"
+                "    def task_a():\n"
+                "        run()\n"
+                "    task_a()\n"
+                "d()\n"
+            )
+            result = RepoScanner(root).scan()
+        op_edges = [e for e in result.edges if e.extraction_method == "operation"]
+        self.assertEqual(op_edges, [])  # no wrong attribution
+        self.assertTrue(
+            any("defined in multiple modules" in w for w in result.warnings),
+            result.warnings,
+        )
+
     def test_owner_dotted_string_is_not_a_table(self):
         # An Airflow `owner` like "first.last" must not be read as a table.
         with tempfile.TemporaryDirectory() as tmp:

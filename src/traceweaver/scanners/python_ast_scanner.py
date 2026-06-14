@@ -88,6 +88,9 @@ class PythonAstScanner:
         # Raw operation accesses are attributed to tasks at the repo level (the
         # call graph that links a task to its helper functions can span files).
         result.io_accesses.extend(visitor.io_accesses)
+        result.defined_functions.extend(
+            (name, module) for name in visitor.defined_functions
+        )
 
         result.dedupe()
         return result
@@ -204,6 +207,9 @@ class _DagAstVisitor(ast.NodeVisitor):
         # Coarse data accesses inferred from library calls; resolved to tasks by
         # RepoScanner once the whole-repo call graph is available.
         self.io_accesses: list[IoAccess] = []
+        # Names of functions defined in this file, so RepoScanner can detect an
+        # ambiguous (multiply-defined) name and refuse to misattribute its I/O.
+        self.defined_functions: set[str] = set()
 
         # task_id keyed sql, with the operator class so we can pick a dialect.
         self.sql_by_task: dict[tuple[str, str], list[tuple[str, str | None]]] = {}
@@ -291,6 +297,7 @@ class _DagAstVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self.defined_functions.add(node.name)
         dag_id = self.decorated_dag_functions.get(node.name)
         if dag_id:
             self.dag_stack.append(dag_id)

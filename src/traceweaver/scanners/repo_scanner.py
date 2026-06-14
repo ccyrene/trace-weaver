@@ -37,10 +37,22 @@ class RepoScanner:
         An access recorded inside a helper function is credited to every task
         whose callable reaches that helper (directly or transitively). Emits a
         half-edge (source for reads, target for writes) per (task, dataset).
+
+        Attribution is keyed by bare function name (cross-file calls carry no
+        resolved module). To avoid *wrong* lineage, an access whose containing
+        function name is defined in more than one module is skipped (with a
+        warning) rather than guessed — a same-named helper elsewhere could
+        otherwise be linked to an unrelated task.
         """
         accesses = result.io_accesses
         if not accesses:
             return
+
+        # Function names defined in more than one module are ambiguous targets.
+        defined_in: dict[str, set[str]] = {}
+        for name, module in result.defined_functions:
+            defined_in.setdefault(name, set()).add(module)
+        ambiguous = {name for name, modules in defined_in.items() if len(modules) > 1}
 
         # Entry-point function name -> the task(s) it belongs to.
         owners: dict[str, set[tuple[str, str]]] = {}
@@ -59,7 +71,17 @@ class RepoScanner:
             callee = (call.function_name or "").rsplit(".", 1)[-1]
             callers.setdefault(callee, set()).add(call.caller_function)
 
+        warned: set[str] = set()
         for access in accesses:
+            if access.caller_function in ambiguous:
+                if access.caller_function not in warned:
+                    warned.add(access.caller_function)
+                    result.warnings.append(
+                        f"Operation lineage skipped for {access.caller_function!r}: "
+                        "the function name is defined in multiple modules, so its "
+                        "data access cannot be attributed to a task unambiguously."
+                    )
+                continue
             for dag_id, task_id in self._tasks_for_function(
                 access.caller_function, owners, callers
             ):
@@ -81,6 +103,7 @@ class RepoScanner:
                     )
                 )
         result.io_accesses = []
+        result.defined_functions = []
 
     @staticmethod
     def _tasks_for_function(
