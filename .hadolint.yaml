@@ -1,0 +1,12 @@
+# Dockerfile lint policy (hadolint)
+# DL3008: apt package version pinning — accepted trade-off; the renderer image's
+#         packages are build-time only and the base image is rebuilt regularly.
+# DL3013: pip version pinning — third-party deps are pinned via the pyproject
+#         extras; the pip self-upgrade / package install stays unpinned on purpose.
+# DL3016: npm package version pinning — mermaid-cli intentionally tracks the
+#         latest release in the optional renderer image.
+ignored:
+  - DL3008
+  - DL3013
+  - DL3016
+failure-threshold: warning

@@ -1,0 +1,8 @@
+# Trivy image-scan baseline — known unfixable/accepted CVEs in the base image.
+#
+# Process (ratchet): when the main gate goes red with a NEW CVE, triage it.
+# If it cannot be fixed without a base-image upgrade, add it here with a
+# comment + date; remove entries when the base image is upgraded. Never add
+# a CVE introduced by code or dependency changes.
+#
+# (empty — no baseline yet; the image gate runs on pushes to main only)

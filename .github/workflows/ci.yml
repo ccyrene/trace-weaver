@@ -1,0 +1,250 @@
+# ==============================================================================
+# TraceWeaver — CI (GitHub Actions)
+# ------------------------------------------------------------------------------
+# Tiers
+#   push (any branch) : fast feedback — lint + secret scan + SAST + tests
+#   pull_request      : full quality + security gate (+ optional AI scan)
+#   push to main      : full gate + Docker image build & CVE scan
+#   workflow_dispatch : on-demand run (e.g. force a full-repo AI scan)
+#
+# Security gates
+#   Gitleaks    secret patterns across the FULL git history (.gitleaks.toml)
+#   TruffleHog  credential detection, verified-only policy
+#   Trivy       secrets + IaC misconfig (fs), image CVEs (main, .trivyignore)
+#   Bandit      Python SAST (MEDIUM+ blocks)
+#   Semgrep     SAST rule packs: p/python, p/security-audit, p/secrets
+#   pip-audit   dependency CVE audit (optional extras)
+#   AI scan     Claude agent reviewing changes (ci/ai_scan.py)
+#
+# AI scan toggle — Settings > Secrets and variables > Actions (no code change):
+#   variables: AI_SCAN_ENABLED=true|false, AI_SCAN_FAIL_ON=critical|high|medium|never
+#   secrets:   ANTHROPIC_API_KEY
+# ==============================================================================
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ai_scan_mode:
+        description: "AI scan mode"
+        type: choice
+        options: [diff, full]
+        default: diff
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Tiering: jobs without an `if` run on every push (fast tier); jobs guarded by
+# the pull_request/main/dispatch condition are the full gate.
+jobs:
+  # ---------------------------------------------------------- quality gates
+  lint:
+    name: "Quality: Python lint & format (ruff)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet ruff==0.6.9
+      - run: ruff check --output-format=full src tests ci
+      - run: ruff format --check src tests ci
+
+  dockerfile-lint:
+    name: "Quality: Dockerfile lint (hadolint)"
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Dockerfile (lean image)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+      - name: Lint Dockerfile.render (renderer image)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile.render
+          config: .hadolint.yaml
+
+  # --------------------------------------------------------- security gates
+  secrets-gitleaks:
+    name: "Security: secret scan, full history (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Gitleaks detect
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:latest \
+            detect --source /repo --config /repo/.gitleaks.toml --redact --verbose \
+            --report-format sarif --report-path /repo/reports/gitleaks.sarif
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-report
+          path: reports/
+          if-no-files-found: ignore
+
+  secrets-trufflehog:
+    name: "Security: verified secret scan (TruffleHog)"
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Verified-only policy: TruffleHog's job here is credentials proven live
+      # against the real service; pattern-based hits are Gitleaks/Trivy's job.
+      - run: |
+          docker run --rm -v "$PWD:/repo" trufflesecurity/trufflehog:latest \
+            git file:///repo --results=verified --fail --no-update
+
+  sast-bandit:
+    name: "Security: Python SAST (Bandit)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet bandit==1.7.10
+      # -ll = fail on MEDIUM severity and above
+      - run: bandit -r src ci -ll
+
+  sast-semgrep:
+    name: "Security: SAST rule packs (Semgrep)"
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+      # Only ERROR-severity rules run; any finding from them blocks the build.
+      - run: |
+          semgrep scan --config p/python --config p/security-audit \
+            --config p/secrets --severity ERROR --error --metrics=off
+
+  deps-audit:
+    name: "Security: dependency CVE audit (pip-audit)"
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pip-audit==2.7.3
+      # Core has no runtime deps (stdlib only); the optional extras (sqlglot,
+      # sqlalchemy, psycopg) are what we audit. --skip-editable ignores the
+      # local package itself. Ratchet ignores here when a CVE has no fix yet:
+      #   - run: pip-audit --skip-editable --ignore-vuln <GHSA-ID>
+      - run: |
+          pip install -e ".[all]"
+          pip-audit --skip-editable
+
+  iac-scan:
+    name: "Security: IaC misconfig + secrets (Trivy fs)"
+    if: ${{ github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy misconfig (report-only) + secret scan (blocking)
+        run: |
+          mkdir -p reports
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
+            fs --scanners misconfig --severity HIGH,CRITICAL --exit-code 0 \
+            --format table --output /repo/reports/trivy-misconfig.txt /repo
+          cat reports/trivy-misconfig.txt
+          docker run --rm -v "$PWD:/repo" aquasec/trivy:latest \
+            fs --scanners secret --exit-code 1 /repo
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-fs-report
+          path: reports/
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------ tests
+  tests:
+    name: "Test: unit & integration tests (pytest)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      # Install all optional extras so the sqlglot/DB-gated tests run too
+      # (they self-skip when the extra is absent).
+      - run: pip install -e ".[dev,all]"
+      - run: pytest -q
+
+  # ------------------------------------------------- AI agent scan (toggle)
+  ai-scan:
+    name: "AI: Claude scan for anything undesirable (toggleable)"
+    if: ${{ vars.AI_SCAN_ENABLED == 'true' && (github.event_name == 'pull_request' || github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet anthropic
+      - run: python ci/ai_scan.py
+        env:
+          AI_SCAN_ENABLED: "true"
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_SCAN_MODE: ${{ inputs.ai_scan_mode || 'diff' }}
+          AI_SCAN_FAIL_ON: ${{ vars.AI_SCAN_FAIL_ON || 'high' }}
+          AI_SCAN_REQUIRED: ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ai-scan-report
+          path: reports/
+          if-no-files-found: ignore
+
+  # ------------------------------------------------- build & image scanning
+  build-image-scan:
+    name: "Build: Docker image + CVE scan (Trivy)"
+    if: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    needs: [lint, sast-bandit, secrets-gitleaks, tests]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f Dockerfile -t "traceweaver:${{ github.run_number }}" .
+      - name: Trivy image scan
+        run: |
+          mkdir -p reports
+          # Full HIGH/CRITICAL report — artifact for review.
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/repo" aquasec/trivy:latest \
+            image --scanners vuln --severity HIGH,CRITICAL --exit-code 0 \
+            --format table --output /repo/reports/trivy-image.txt \
+            "traceweaver:${{ github.run_number }}"
+          cat reports/trivy-image.txt
+          # Gate: NEW fixable CRITICAL vulnerabilities block the build; known
+          # base-image CVEs are baselined in .trivyignore (ratchet process).
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD:/repo" aquasec/trivy:latest \
+            image --scanners vuln --severity CRITICAL --ignore-unfixed \
+            --ignorefile /repo/.trivyignore --exit-code 1 \
+            "traceweaver:${{ github.run_number }}"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-image-report
+          path: reports/
+          if-no-files-found: ignore
