@@ -52,9 +52,11 @@ class TestDbExporter(unittest.TestCase):
                 "function_calls",
                 "raw_scan_results",
             ):
-                out[table] = conn.execute(
-                    sa.text(f"SELECT COUNT(*) FROM {table}")
-                ).scalar()
+                # `table` is one of the hardcoded schema names above, never user
+                # input; a SQL identifier cannot be passed as a bound parameter.
+                # nosemgrep: python.sqlalchemy.security.audit.avoid-sqlalchemy-text.avoid-sqlalchemy-text
+                count_sql = sa.text(f"SELECT COUNT(*) FROM {table}")
+                out[table] = conn.execute(count_sql).scalar()
         engine.dispose()
         return out
 
