@@ -1,0 +1,59 @@
+# TraceWeaver compose.
+#
+# Default (CSV + JSON to ./out):
+#     mkdir -p dags out && cp /path/to/your/dags/*.py dags/
+#     docker compose run --rm traceweaver
+#   For host-owned output files:
+#     docker compose run --rm --user "$(id -u):$(id -g)" traceweaver
+#
+# Scan straight into Postgres (creates the schema, then loads it):
+#     docker compose --profile db up --build
+#
+# Note: every service is behind a profile so that `--profile db up` does not
+# also trigger the file-output scan. Use `docker compose run` (which activates
+# the target service's profile automatically) or `--profile scan up`.
+services:
+  traceweaver:
+    build: .
+    image: traceweaver:latest
+    profiles: ["scan"]
+    volumes:
+      # Mount your DAG repository here (read-only):
+      - ./dags:/dags:ro
+      - ./out:/out
+    # Uses the image defaults: scan /dags, write CSV + JSON to /out.
+
+  # --- Optional Postgres target (enabled with: --profile db) ---
+  db:
+    image: postgres:16-alpine
+    profiles: ["db"]
+    environment:
+      POSTGRES_USER: lineage
+      POSTGRES_PASSWORD: lineage
+      POSTGRES_DB: lineage
+    volumes:
+      - ./database/migrations:/docker-entrypoint-initdb.d:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lineage -d lineage"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  traceweaver-db:
+    build: .
+    image: traceweaver:latest
+    profiles: ["db"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TRACEWEAVER_OUTPUT_FORMAT: db
+      TRACEWEAVER_DATABASE_URL: postgresql://lineage:lineage@db:5432/lineage
+    volumes:
+      - ./dags:/dags:ro
+
+volumes:
+  pgdata:

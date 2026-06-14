@@ -1,0 +1,34 @@
+# --- Python ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+*.db
+.coverage
+htmlcov/
+
+# --- Scan outputs (generated; may contain real lineage from scanned repos) ---
+# Never commit anything under outputs/ except the directory placeholders.
+/outputs/**
+!/outputs/**/
+!/outputs/**/.gitkeep
+out/
+
+# --- Input DAGs (may be proprietary / organizational — never commit) ---
+dags/
+
+# --- CI scanner artifacts ---
+reports/
+
+# --- Local env / secrets ---
+.env
+.env.*
+!.env.example
+
+# --- OS ---
+.DS_Store

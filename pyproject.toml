@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "traceweaver"
+version = "0.1.0"
+description = "Static lineage scanner CLI for Airflow DAG repositories"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "TraceWeaver Contributors" }
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0"
+]
+sql = [
+  "sqlglot>=25.0.0"
+]
+db = [
+  "psycopg[binary]>=3.1.0",
+  "sqlalchemy>=2.0.0"
+]
+all = [
+  "sqlglot>=25.0.0",
+  "psycopg[binary]>=3.1.0",
+  "sqlalchemy>=2.0.0"
+]
+
+[project.scripts]
+traceweaver = "traceweaver.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

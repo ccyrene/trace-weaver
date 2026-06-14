@@ -1,0 +1,64 @@
+# TraceWeaver — OPTIONAL heavy image that renders the Mermaid graph to PNG/SVG.
+# The default ./Dockerfile is a lean (<100 MB) image that writes lineage.mmd.
+#
+# Build:  docker build -f Dockerfile.render -t traceweaver:render .
+# Scan :  docker run --rm -v "$PWD/dags:/dags:ro" -v "$PWD/out:/out" traceweaver:render
+#
+# Bundles Node.js + Chromium + mermaid-cli (~2.4 GB); writes lineage.svg +
+# lineage.png alongside lineage.mmd.
+FROM python:3.11-slim
+
+# WITH_RENDERER=true  -> install Node.js + Chromium + mermaid-cli (PNG/SVG).
+# WITH_RENDERER=false -> text-only image (much smaller); use --image-format none.
+ARG WITH_RENDERER=true
+ARG IMAGE_FORMAT=both
+
+# Use the system Chromium rather than letting Puppeteer download its own.
+ENV PUPPETEER_SKIP_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+
+RUN set -eux; \
+    apt-get update; \
+    if [ "$WITH_RENDERER" = "true" ]; then \
+        apt-get install -y --no-install-recommends \
+            git nodejs npm chromium \
+            fonts-liberation fonts-dejavu-core fonts-thai-tlwg; \
+        npm install -g @mermaid-js/mermaid-cli; \
+        npm cache clean --force; \
+    else \
+        apt-get install -y --no-install-recommends git; \
+    fi; \
+    apt-get clean; \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+
+# Install third-party Python deps first, keyed on pyproject.toml, so editing
+# source does not invalidate this layer. (Keep in sync with the sql/db extras.)
+COPY pyproject.toml README.md ./
+RUN pip install --no-cache-dir "sqlglot>=25.0.0" "sqlalchemy>=2.0.0" "psycopg[binary]>=3.1.0"
+
+# Then install the package itself (cheap; dependencies already satisfied).
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps .
+
+# Bundled sample DAGs and reference assets — handy for a first run / demo.
+COPY examples ./examples
+COPY docs ./docs
+COPY database ./database
+
+# Defaults: read-only DAGs in, artifacts out. IMAGE_FORMAT follows the build
+# arg (both for the full image, none for the lean one). HOME=/tmp gives headless
+# Chromium a writable home when run with --user.
+ENV TRACEWEAVER_REPO_PATH=/dags \
+    TRACEWEAVER_OUTPUT_DIR=/out \
+    TRACEWEAVER_OUTPUT_FORMAT=all \
+    TRACEWEAVER_IMAGE_FORMAT=${IMAGE_FORMAT} \
+    HOME=/tmp \
+    PYTHONUNBUFFERED=1
+RUN mkdir -p /dags /out
+
+# Runs as root so writes to a bind-mounted /out always succeed; for host-owned
+# files run with: --user "$(id -u):$(id -g)"
+ENTRYPOINT ["traceweaver"]
+CMD ["scan"]
