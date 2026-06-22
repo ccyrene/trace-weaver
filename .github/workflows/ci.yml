@@ -109,10 +109,20 @@ jobs:
         with:
           fetch-depth: 0 # full history so gitleaks scans every commit
 
-      - name: Gitleaks
-        uses: gitleaks/gitleaks-action@v2
-        env:
-          GITLEAKS_CONFIG: .gitleaks.toml
+      # Run the gitleaks CLI directly over the full history rather than
+      # gitleaks-action@v2: on a push the action scans only the pushed commit
+      # range (`before^..after`) and fatally errors when that range begins at a
+      # root commit (e.g. right after a history rewrite / force-push). A direct
+      # `detect` honours the fetch-depth:0 full-history intent and is robust to
+      # force-pushes and initial commits.
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.24.3
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: Gitleaks (full-history scan)
+        run: gitleaks detect --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
 
   dockerfile-lint:
     name: Dockerfile lint (hadolint)
