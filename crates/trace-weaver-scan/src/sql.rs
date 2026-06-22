@@ -86,6 +86,17 @@ pub fn column_lineage_from_sql(sql: &str) -> anyhow::Result<SqlColumnLineage> {
     Ok(SqlColumnLineage::default())
 }
 
+/// Column lineage for a single SELECT-item fragment, e.g. `"amount * 1.08 AS x"`
+/// or `"a + b"`. Reuses the full projection machinery by wrapping the fragment as
+/// `SELECT <item>`. Used by the pandas/Spark dataflow analyzer to read SQL-string
+/// expressions (`selectExpr(...)`, `expr("...")`). Returns the per-target mappings
+/// (usually one); empty when the fragment can't be parsed.
+pub fn select_expr_lineage(item: &str) -> Vec<SqlMapping> {
+    column_lineage_from_sql(&format!("SELECT {item}"))
+        .map(|l| l.mappings)
+        .unwrap_or_default()
+}
+
 /// Build lineage from a top-level query.
 ///
 /// * **INSERT mode** (`target_cols` non-empty): the INSERT column list is the

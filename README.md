@@ -107,17 +107,19 @@ The compiler treats your declarations as the source of truth and only *fills gap
 2. If `engine="sql"` and `sql=...` is present, the compiler **parses the SQL** to
    auto-derive lineage for any target column *not* already in `column_map`
    (tagged *inferred from SQL*).
-3. Remaining gaps may be filled by a **conservative same-name identity gap-fill**
-   (tagged *inferred from code*, confidence `0.4`). This only copies an output
-   column when an input column has the **identical name**; it does **not** trace
-   pandas/Spark dataflow and cannot invent a column you never named.
+3. For `pandas`/`spark`/`python` tasks the compiler **statically reads the function
+   body** and traces column flow (`df["c"] = df["a"] * 2`, `withColumn`, `select`,
+   `groupby/agg`, `rename`, `expr("…")`, …), tagged *inferred from code* (≈`0.7`).
+   A conservative same-name identity gap-fill (≈`0.4`) fills anything still missing.
 
 Exporters append `(inferred from SQL)` / `(inferred from code)` to inferred
 labels, so a human can always tell declared truth from a machine guess.
 
-> **For `pandas`/`spark`/`python` tasks you must declare a `column_map`.**
-> Without one you get only table-level lineage plus a `W_NO_COLUMN_LINEAGE`
-> warning — code inference will not reconstruct your column logic.
+> **You usually don't need a `column_map` anymore** — the compiler derives column
+> lineage from the SQL and the pandas/Spark body. Patterns it can't read statically
+> (dynamic column names, named UDFs / `.rdd`, joins, pivots) raise `W_OPAQUE_COLUMN` with
+> the exact line; refactor to a traceable form or declare just that column. See
+> [`TRACEABLE_PIPELINES.md`](TRACEABLE_PIPELINES.md) for the do/don't guide.
 
 ## Decorator reference
 

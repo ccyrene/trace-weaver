@@ -11,8 +11,10 @@
 //! 3. When `engine="sql"` and a `sql=` query is present, [`sql`] auto-extracts
 //!    column lineage to fill any columns the engineer didn't map by hand
 //!    (origin = **inferred from SQL**).
-//! 4. [`infer`] applies best-effort code heuristics to fill remaining gaps
-//!    (origin = **inferred from code**).
+//! 4. [`dataflow`] traces the task's function BODY (pandas/Spark) for column
+//!    lineage, and [`infer`] fills any remaining same-name identity gaps
+//!    (both origin = **inferred from code**). Untraceable spots are reported as
+//!    `W_OPAQUE_COLUMN`, never silently dropped.
 //!
 //! Declared facts always win; inference only fills gaps and is tagged so
 //! exporters can render `(inferred …)` next to it.
@@ -27,8 +29,10 @@ use trace_weaver_core::{
 use crate::python::{ColumnMapEntry, ModuleConfig, TaskDecl};
 use crate::sql::{SqlColRef, SqlMapping};
 
+pub mod dataflow;
 pub mod infer;
 pub mod python;
+pub mod resolve;
 pub mod sql;
 
 /// Knobs controlling a scan.
@@ -57,6 +61,10 @@ impl Default for ScanOptions {
 
 /// Confidence assigned to SQL-inferred column lineage.
 const SQL_CONFIDENCE: f32 = 0.85;
+
+/// Confidence assigned to column lineage traced from pandas/Spark code. Lower
+/// than SQL (looser semantics), higher than the same-name identity gap-fill.
+const CODE_DATAFLOW_CONFIDENCE: f32 = 0.7;
 
 /// Recursively scan every `*.py` file under `root` and assemble one document.
 ///
@@ -257,6 +265,21 @@ fn scan_decl(
     // ── Hygiene diagnostics (findings #6, #10; I/O still required) ───────
     emit_decl_diagnostics(decl, engine, &inputs, &outputs, &loc, doc);
 
+    // Spots the pandas/Spark dataflow analyzer could not trace — tell the engineer
+    // exactly which column to declare by hand, instead of silently dropping it.
+    if opts.enable_code_inference {
+        for note in &decl.opaque {
+            let mut d = Diagnostic::warn(
+                "W_OPAQUE_COLUMN",
+                format!("task '{}': {}", decl.task_name, note.detail),
+            );
+            if let Some(line) = note.line {
+                d = d.at(SourceLoc::new(path, Some(line)));
+            }
+            doc.diagnostics.push(d);
+        }
+    }
+
     // 1. Upsert datasets for every input and output.
     for ds_name in inputs.iter().chain(outputs.iter()) {
         doc.upsert_dataset(build_dataset(ds_name));
@@ -320,9 +343,18 @@ fn scan_decl(
     // 4. Build column lineage once per output, then distribute each mapping to
     //    the (input, output) edges its sources actually belong to (finding #4).
     let default_input = inputs.first().cloned();
+    let single_output = outputs.len() == 1;
     for output in &outputs {
         let col_edges = match &default_input {
-            Some(di) => build_output_column_edges(decl, output, di, &inputs, sql_lineage.as_ref()),
+            Some(di) => build_output_column_edges(
+                decl,
+                output,
+                di,
+                &inputs,
+                sql_lineage.as_ref(),
+                opts.enable_code_inference,
+                single_output,
+            ),
             None => Vec::new(),
         };
 
@@ -452,6 +484,8 @@ fn build_output_column_edges(
     default_input: &str,
     all_inputs: &[String],
     sql_lineage: Option<&sql::SqlColumnLineage>,
+    enable_code_inference: bool,
+    single_output: bool,
 ) -> Vec<ColumnEdge> {
     let mut edges: Vec<ColumnEdge> = Vec::new();
     let mut mapped: Vec<String> = Vec::new();
@@ -481,6 +515,31 @@ fn build_output_column_edges(
                 edges.push(sql_column_edge(m, default_input, output, all_inputs));
                 mapped.push(m.target.clone());
             }
+        }
+    }
+
+    // ── Inferred from code (pandas/Spark dataflow), gap-filling only ──
+    if enable_code_inference {
+        for c in &decl.inferred_columns {
+            if mapped.iter().any(|t| t == &c.target) {
+                continue;
+            }
+            // Attach to this output when the analyzer named its table, or when
+            // the table is unknown and there is exactly one output.
+            let applies = match &c.output_table {
+                Some(t) => output.rsplit('.').next() == Some(t.as_str()) || output == t,
+                None => single_output,
+            };
+            if !applies {
+                continue;
+            }
+            edges.push(inferred_code_column_edge(
+                c,
+                default_input,
+                output,
+                all_inputs,
+            ));
+            mapped.push(c.target.clone());
         }
     }
 
@@ -517,6 +576,25 @@ fn sql_column_edge(m: &SqlMapping, input: &str, output: &str, all_inputs: &[Stri
     ce.function = Some(m.function.clone());
     ce.transform_type = m.transform_type;
     ce.origin = Origin::inferred_sql(SQL_CONFIDENCE);
+    ce
+}
+
+/// Build a ColumnEdge from a code-dataflow-inferred mapping (pandas/Spark).
+fn inferred_code_column_edge(
+    c: &crate::dataflow::InferredColumn,
+    input: &str,
+    output: &str,
+    all_inputs: &[String],
+) -> ColumnEdge {
+    let from_columns: Vec<ColumnRef> = c
+        .sources
+        .iter()
+        .map(|s| resolve_source_ref(s, input, all_inputs))
+        .collect();
+    let mut ce = ColumnEdge::new(from_columns, ColumnRef::new(output, c.target.clone()));
+    ce.function = c.function.clone();
+    ce.transform_type = c.transform_type;
+    ce.origin = Origin::inferred_code(CODE_DATAFLOW_CONFIDENCE).with_note("pandas/Spark dataflow");
     ce
 }
 

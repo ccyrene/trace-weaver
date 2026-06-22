@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use rustpython_parser::ast::{self, Constant, Expr, Ranged, Stmt};
 use rustpython_parser::Parse;
 
+use crate::dataflow::{InferredColumn, OpaqueNote};
+
 /// One column-map tuple `(sources, target, function)` from a `column_map=[...]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ColumnMapEntry {
@@ -44,6 +46,13 @@ pub struct TaskDecl {
     /// `.format(...)`, or string concatenation). Such values are dropped, so the
     /// scanner surfaces a `W_NON_LITERAL` diagnostic for each — see finding #6.
     pub unresolved: Vec<String>,
+    /// Column lineage statically recovered from the task's function BODY
+    /// (pandas/Spark dataflow), tagged inferred-from-code. Fills gaps the engineer
+    /// did not declare in `column_map`.
+    pub inferred_columns: Vec<InferredColumn>,
+    /// Spots in the body the dataflow analyzer could not trace — surfaced as
+    /// `W_OPAQUE_COLUMN` so the engineer knows exactly what to declare by hand.
+    pub opaque: Vec<OpaqueNote>,
 }
 
 /// Per-file defaults from a module-level `tw.configure(...)` call and/or a
@@ -106,7 +115,15 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
         };
         for deco in &func.decorator_list {
             if let Some((call, kind)) = task_decorator_call(deco) {
-                tasks.push(build_decl(func.name.as_str(), call, source, &consts, kind));
+                let mut decl = build_decl(func.name.as_str(), call, source, &consts, kind);
+                // Trace the function body for column lineage (pandas/Spark). SQL
+                // tasks are handled by the SQL analyzer, so skip dataflow there.
+                if !matches!(kind, DecoratorKind::Sql) && decl.engine.as_deref() != Some("sql") {
+                    let r = crate::dataflow::analyze(&func.body, &consts, source);
+                    decl.inferred_columns = r.columns;
+                    decl.opaque = r.opaque;
+                }
+                tasks.push(decl);
                 break; // one trace-weaver decorator per function
             }
         }
@@ -201,7 +218,7 @@ fn single_target_name(targets: &[Expr]) -> Option<String> {
 }
 
 /// Extract a string literal from a Constant expression.
-fn const_str(expr: &Expr) -> Option<String> {
+pub(crate) fn const_str(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Constant(c) => match &c.value {
             Constant::Str(s) => Some(s.clone()),
@@ -226,7 +243,7 @@ fn task_decorator_call(deco: &Expr) -> Option<(&ast::ExprCall, DecoratorKind)> {
 }
 
 /// Final dotted segment of a callee expression: `task`, `tw.task` -> "task".
-fn callee_final_segment(func: &Expr) -> Option<String> {
+pub(crate) fn callee_final_segment(func: &Expr) -> Option<String> {
     match func {
         Expr::Name(n) => Some(n.id.to_string()),
         Expr::Attribute(a) => Some(a.attr.to_string()),
@@ -236,7 +253,7 @@ fn callee_final_segment(func: &Expr) -> Option<String> {
 
 /// Resolve an expression to a string: either a literal, or a NAME reference
 /// into the module-level constant table.
-fn resolve_str(expr: &Expr, consts: &HashMap<String, String>) -> Option<String> {
+pub(crate) fn resolve_str(expr: &Expr, consts: &HashMap<String, String>) -> Option<String> {
     if let Some(s) = const_str(expr) {
         return Some(s);
     }
@@ -400,7 +417,7 @@ fn build_decl(
 }
 
 /// Convert a byte offset to a 1-based line number.
-fn byte_to_line(source: &str, byte_off: usize) -> u32 {
+pub(crate) fn byte_to_line(source: &str, byte_off: usize) -> u32 {
     let off = byte_off.min(source.len());
     let line = source.as_bytes()[..off]
         .iter()
