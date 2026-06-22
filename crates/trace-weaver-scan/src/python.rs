@@ -106,8 +106,17 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
 
     let config = extract_module_config(&suite, &consts);
 
-    // Second pass: find decorated functions.
+    // Module-level function defs, for resolving `python_callable=fn`.
+    let mut funcs: HashMap<&str, &ast::StmtFunctionDef> = HashMap::new();
+    for stmt in &suite {
+        if let Stmt::FunctionDef(f) = stmt {
+            funcs.insert(f.name.as_str(), f);
+        }
+    }
+
+    // Pass A: explicit `@tw.task` / `@tw.sql` declarations (also the override form).
     let mut tasks = Vec::new();
+    let mut decorated: std::collections::HashSet<String> = std::collections::HashSet::new();
     for stmt in &suite {
         let func = match stmt {
             Stmt::FunctionDef(f) => f,
@@ -115,6 +124,7 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
         };
         for deco in &func.decorator_list {
             if let Some((call, kind)) = task_decorator_call(deco) {
+                decorated.insert(func.name.to_string());
                 let mut decl = build_decl(func.name.as_str(), call, source, &consts, kind);
                 // Trace the function body for column lineage (pandas/Spark). SQL
                 // tasks are handled by the SQL analyzer, so skip dataflow there.
@@ -128,7 +138,129 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
             }
         }
     }
+
+    // Pass B: decorator-FREE discovery from raw Airflow operators. A plain DAG with
+    // no `@tw` still yields lineage: PythonOperator(python_callable=fn) analyzes the
+    // callable's body, and SQL operators (sql=/query=) parse their query. A `@tw`
+    // decorator on the same function overrides (deduped by name).
+    discover_operators(&suite, source, &consts, &funcs, &decorated, &mut tasks);
+
     Ok(ScannedModule { config, tasks })
+}
+
+/// One keyword argument of a call by name.
+fn kwarg<'a>(call: &'a ast::ExprCall, name: &str) -> Option<&'a Expr> {
+    call.keywords
+        .iter()
+        .find(|k| k.arg.as_ref().map(|i| i.as_str()) == Some(name))
+        .map(|k| &k.value)
+}
+
+/// Walk `with DAG(...)` / module statements for Airflow operator constructors and
+/// synthesize a [`TaskDecl`] for each data-producing one (no `@tw` required).
+fn discover_operators(
+    stmts: &[Stmt],
+    source: &str,
+    consts: &HashMap<String, String>,
+    funcs: &HashMap<&str, &ast::StmtFunctionDef>,
+    decorated: &std::collections::HashSet<String>,
+    tasks: &mut Vec<TaskDecl>,
+) {
+    for stmt in stmts {
+        // Operators appear as `x = XOperator(...)` or a bare `XOperator(...)`.
+        let call = match stmt {
+            Stmt::Assign(a) => match a.value.as_ref() {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            Stmt::Expr(e) => match e.value.as_ref() {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(c) = call {
+            if let Some(decl) = build_operator_task(c, source, consts, funcs, decorated) {
+                if !tasks.iter().any(|t| t.task_name == decl.task_name) {
+                    tasks.push(decl);
+                }
+            }
+        }
+        // Recurse into block bodies (with DAG(...): / if / for / while / try).
+        match stmt {
+            Stmt::With(w) => discover_operators(&w.body, source, consts, funcs, decorated, tasks),
+            Stmt::If(i) => {
+                discover_operators(&i.body, source, consts, funcs, decorated, tasks);
+                discover_operators(&i.orelse, source, consts, funcs, decorated, tasks);
+            }
+            Stmt::For(f) => discover_operators(&f.body, source, consts, funcs, decorated, tasks),
+            Stmt::While(w) => discover_operators(&w.body, source, consts, funcs, decorated, tasks),
+            Stmt::Try(t) => {
+                discover_operators(&t.body, source, consts, funcs, decorated, tasks);
+                discover_operators(&t.finalbody, source, consts, funcs, decorated, tasks);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Synthesize a [`TaskDecl`] from one Airflow operator constructor call, or `None`
+/// if it is not a recognised data-producing operator.
+fn build_operator_task(
+    call: &ast::ExprCall,
+    source: &str,
+    consts: &HashMap<String, String>,
+    funcs: &HashMap<&str, &ast::StmtFunctionDef>,
+    decorated: &std::collections::HashSet<String>,
+) -> Option<TaskDecl> {
+    let callee = callee_final_segment(&call.func)?;
+    if !callee.ends_with("Operator") {
+        return None;
+    }
+    let task_id = kwarg(call, "task_id").and_then(const_str);
+    let line = Some(byte_to_line(source, call.range().start().to_usize()));
+
+    // PythonOperator(python_callable=fn) — analyze the callable's body.
+    if let Some(Expr::Name(fname)) = kwarg(call, "python_callable") {
+        let fname = fname.id.as_str();
+        if decorated.contains(fname) {
+            return None; // an explicit @tw decorator on this function overrides
+        }
+        let func = funcs.get(fname)?;
+        let r = crate::dataflow::analyze(&func.body, consts, source);
+        if r.inputs.is_empty() && r.outputs.is_empty() && r.columns.is_empty() {
+            return None; // nothing data-producing we can see statically
+        }
+        return Some(TaskDecl {
+            task_name: task_id.unwrap_or_else(|| fname.to_string()),
+            inputs: r.inputs,
+            outputs: r.outputs,
+            engine: Some(r.engine.unwrap_or_else(|| "python".to_string())),
+            inferred_columns: r.columns,
+            opaque: r.opaque,
+            line,
+            ..Default::default()
+        });
+    }
+
+    // SQL operator (sql=/query=) — parse the query for table + column lineage.
+    let sql = kwarg(call, "sql")
+        .or_else(|| kwarg(call, "query"))
+        .and_then(|e| resolve_str(e, consts));
+    if let Some(sql_text) = sql {
+        let lineage = crate::sql::column_lineage_from_sql(&sql_text).ok()?;
+        let outputs = lineage.target_table.into_iter().collect();
+        return Some(TaskDecl {
+            task_name: task_id.unwrap_or_else(|| "sql_task".to_string()),
+            engine: Some("sql".to_string()),
+            sql: Some(sql_text),
+            inputs: lineage.source_tables,
+            outputs,
+            line,
+            ..Default::default()
+        });
+    }
+    None
 }
 
 /// Read a module-level `tw.configure(service=, database=, schema=, dag=)` call
@@ -590,5 +722,46 @@ def f():
         // The constant ref resolves; the f-string does not, so it's dropped + flagged.
         assert_eq!(d.copy, vec!["amount"]);
         assert!(d.unresolved.contains(&"copy".to_string()));
+    }
+
+    #[test]
+    fn discovers_plain_airflow_operators_without_decorators() {
+        // A plain Airflow DAG with NO @tw: SQL operator + PythonOperator callable.
+        let src = r#"
+from airflow import DAG
+BRONZE_SQL = "INSERT INTO bronze_sales (event_id) SELECT raw_id FROM landing_sales"
+
+def build_silver():
+    bronze = pd.read_sql("SELECT * FROM bronze_sales", con=E)
+    silver = pd.DataFrame()
+    silver["event_id"]   = bronze["event_id"]
+    silver["amount_usd"] = bronze["amount"] * 1.08
+    silver.to_sql("silver_sales", con=E)
+
+with DAG("medallion") as dag:
+    bronze = PostgresOperator(task_id="bronze", sql=BRONZE_SQL)
+    silver = PythonOperator(task_id="silver", python_callable=build_silver)
+    bronze >> silver
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let names: Vec<&str> = m.tasks.iter().map(|t| t.task_name.as_str()).collect();
+        assert!(
+            names.contains(&"bronze") && names.contains(&"silver"),
+            "{names:?}"
+        );
+
+        let bronze = m.tasks.iter().find(|t| t.task_name == "bronze").unwrap();
+        assert_eq!(bronze.engine.as_deref(), Some("sql"));
+        assert_eq!(bronze.inputs, vec!["landing_sales"]);
+        assert_eq!(bronze.outputs, vec!["bronze_sales"]);
+
+        let silver = m.tasks.iter().find(|t| t.task_name == "silver").unwrap();
+        assert_eq!(silver.engine.as_deref(), Some("pandas"));
+        assert_eq!(silver.inputs, vec!["bronze_sales"]);
+        assert_eq!(silver.outputs, vec!["silver_sales"]);
+        assert!(silver
+            .inferred_columns
+            .iter()
+            .any(|c| c.target == "amount_usd"));
     }
 }

@@ -46,6 +46,12 @@ pub struct ScanOptions {
     pub enable_sql_inference: bool,
     /// Best-effort code analysis (pandas/Spark) to fill undeclared gaps.
     pub enable_code_inference: bool,
+    /// Default FQN parts for raw DAGs without `tw.configure(...)`. They fill any
+    /// gap the file's own `configure()` left, so bare table names expand to
+    /// `service.database.schema.table` and export to OpenMetadata.
+    pub service: Option<String>,
+    pub database: Option<String>,
+    pub schema: Option<String>,
 }
 
 impl Default for ScanOptions {
@@ -55,6 +61,9 @@ impl Default for ScanOptions {
             producer: concat!("trace-weaver/", env!("CARGO_PKG_VERSION")).to_string(),
             enable_sql_inference: true,
             enable_code_inference: true,
+            service: None,
+            database: None,
+            schema: None,
         }
     }
 }
@@ -220,8 +229,20 @@ pub fn scan_source(
     doc: &mut WeaveDocument,
 ) -> anyhow::Result<()> {
     let module = python::extract_task_decls(source)?;
+    // CLI-supplied FQN defaults fill any part the file's own configure() left unset,
+    // so raw DAGs (no tw.configure) still expand bare table names to full FQNs.
+    let mut config = module.config;
+    if config.service.is_none() {
+        config.service = opts.service.clone();
+    }
+    if config.database.is_none() {
+        config.database = opts.database.clone();
+    }
+    if config.schema.is_none() {
+        config.schema = opts.schema.clone();
+    }
     for decl in &module.tasks {
-        scan_decl(path, decl, &module.config, opts, doc);
+        scan_decl(path, decl, &config, opts, doc);
     }
     Ok(())
 }
@@ -267,8 +288,23 @@ fn scan_decl(
 
     // Spots the pandas/Spark dataflow analyzer could not trace — tell the engineer
     // exactly which column to declare by hand, instead of silently dropping it.
+    // A note about a column the engineer ALREADY declared (column_map / copy) is
+    // just noise — the declaration covers it — so suppress those. The two notes
+    // that name a target embed it as `"col"`, which is how we match it here.
     if opts.enable_code_inference {
+        let declared: std::collections::HashSet<&str> = decl
+            .column_map
+            .iter()
+            .map(|e| e.target.as_str())
+            .chain(decl.copy.iter().map(|s| s.as_str()))
+            .collect();
         for note in &decl.opaque {
+            if declared
+                .iter()
+                .any(|c| note.detail.contains(&format!("\"{c}\"")))
+            {
+                continue;
+            }
             let mut d = Diagnostic::warn(
                 "W_OPAQUE_COLUMN",
                 format!("task '{}': {}", decl.task_name, note.detail),
@@ -671,6 +707,7 @@ mod tests {
             producer: "test".into(),
             enable_sql_inference: true,
             enable_code_inference: true,
+            ..Default::default()
         }
     }
 
@@ -1120,5 +1157,29 @@ def t2(): ...
             ab.column_lineage
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opaque_note_suppressed_for_declared_column() {
+        // A column the engineer DECLARED must not raise W_OPAQUE_COLUMN even when
+        // its body is untraceable (here a named-callable apply): the declaration
+        // already covers it, so the warning would be noise.
+        let src = r#"
+import trace_weaver as tw
+@tw.task(inputs=["s.d.p.a"], outputs=["s.d.p.b"], engine="pandas",
+         column_map=[(["x"], "y", "row udf")])
+def t():
+    src = pd.read_sql("SELECT * FROM a", con=E)
+    out = pd.DataFrame()
+    out["y"] = src.apply(weird, axis=1)
+    out.to_sql("b", con=E)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            !codes.contains(&"W_OPAQUE_COLUMN"),
+            "declared column 'y' must not raise W_OPAQUE_COLUMN: {codes:?}"
+        );
     }
 }

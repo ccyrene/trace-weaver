@@ -5,6 +5,11 @@
 > trace-weaver อ่านโค้ดแบบ static (ไม่รัน DAG) — มันจึงอ่านได้เฉพาะสิ่งที่ "เห็นชื่อ column
 > และที่มาได้ตรง ๆ จากโค้ด". เขียนตามคู่มือนี้แล้ว lineage จะออกมาครบเองโดยแก้โค้ดน้อยที่สุด.
 
+> **ไม่ต้องมี `@tw` ก็ได้** — trace-weaver scan DAG เปล่า ๆ ได้: discover task จาก
+> `PythonOperator(python_callable=…)` + SQL operators เอง แล้วอ่าน SQL/pandas/Spark body
+> เป็น lineage. `@tw.task` เหลือไว้ใช้ **override** เฉพาะจุดที่อ่านไม่ได้. (DAG เปล่าต้องมี
+> `--service/--database/--schema` ที่ CLI เพื่อขยายชื่อ table เป็น FQN เข้า OpenMetadata)
+
 ## กฎเดียวที่ต้องจำ
 
 > **ชื่อ column เป็น literal (เขียนตรง ๆ ในโค้ด) + ที่มาอ้าง column ตรง ๆ → เครื่องอ่านเอง**

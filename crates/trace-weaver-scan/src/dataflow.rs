@@ -52,6 +52,12 @@ pub struct OpaqueNote {
 pub struct DataflowResult {
     pub columns: Vec<InferredColumn>,
     pub opaque: Vec<OpaqueNote>,
+    /// Source tables read in the body (read_sql / read_* / spark.read.table / sql).
+    pub inputs: Vec<String>,
+    /// Tables written in the body (to_sql / saveAsTable / insertInto).
+    pub outputs: Vec<String>,
+    /// Engine detected from the body ("pandas" / "spark"), if any.
+    pub engine: Option<String>,
 }
 
 /// A column reference with an optional owning table.
@@ -212,6 +218,10 @@ struct Analyzer<'a> {
     /// (row-lambda param, its frame's table) while reading an inline
     /// `df.apply(lambda r: …, axis=1)` — `r["x"]`/`r.x` are columns of that table.
     row_alias: Option<(String, Option<String>)>,
+    /// Source tables read by the body, accumulated from readers (first-seen order).
+    inputs: Vec<String>,
+    saw_spark: bool,
+    saw_pandas: bool,
 }
 
 /// Statically analyse a function `body` for column lineage.
@@ -225,6 +235,9 @@ pub fn analyze(body: &[Stmt], consts: &HashMap<String, String>, source: &str) ->
         opaque: Vec::new(),
         loop_subst: None,
         row_alias: None,
+        inputs: Vec::new(),
+        saw_spark: false,
+        saw_pandas: false,
     };
     a.block(body);
     a.finish()
@@ -498,6 +511,17 @@ impl<'a> Analyzer<'a> {
             if READERS.contains(seg) {
                 base_table = self.reader_table(seg, call);
                 start = 1;
+                if let Some(t) = &base_table {
+                    if !self.inputs.contains(t) {
+                        self.inputs.push(t.clone());
+                    }
+                }
+                // Engine hint from the reader family.
+                if seg.starts_with("read_") {
+                    self.saw_pandas = true;
+                } else if innermost_name(base) == Some("spark") {
+                    self.saw_spark = true;
+                }
             }
         }
 
@@ -887,6 +911,12 @@ impl<'a> Analyzer<'a> {
             "to_parquet" | "to_csv" | "parquet" | "csv" | "save" => None, // path output
             _ => return,
         };
+        // Engine hint from the writer family.
+        match *seg {
+            "to_sql" | "to_parquet" | "to_csv" => self.saw_pandas = true,
+            "saveAsTable" | "insertInto" | "parquet" | "save" => self.saw_spark = true,
+            _ => {}
+        }
         // Resolve which frame variable is being written. The receiver may be
         // several attributes deep, e.g. `df.write.mode(...).saveAsTable(...)`, so
         // walk down to the innermost Name.
@@ -975,6 +1005,23 @@ impl<'a> Analyzer<'a> {
                     self.collect_cols(e, out);
                 }
             }
+            // Comparisons (`amount > 0`), boolean ops (`a & b`), conditionals.
+            Expr::Compare(c) => {
+                self.collect_cols(&c.left, out);
+                for cmp in &c.comparators {
+                    self.collect_cols(cmp, out);
+                }
+            }
+            Expr::BoolOp(b) => {
+                for v in &b.values {
+                    self.collect_cols(v, out);
+                }
+            }
+            Expr::IfExp(e) => {
+                self.collect_cols(&e.body, out);
+                self.collect_cols(&e.orelse, out);
+                self.collect_cols(&e.test, out);
+            }
             _ => {}
         }
     }
@@ -1017,8 +1064,15 @@ impl<'a> Analyzer<'a> {
             writes,
             columns,
             opaque,
+            inputs,
+            saw_spark,
+            saw_pandas,
             ..
         } = self;
+        // outputs = distinct tables written (sorted for a deterministic document).
+        let mut outputs: Vec<String> = writes.values().flatten().cloned().collect();
+        outputs.sort();
+        outputs.dedup();
         let cols = columns
             .into_iter()
             .map(|(owner, mut c)| {
@@ -1028,9 +1082,19 @@ impl<'a> Analyzer<'a> {
                 c
             })
             .collect();
+        let engine = if saw_spark {
+            Some("spark".to_string())
+        } else if saw_pandas {
+            Some("pandas".to_string())
+        } else {
+            None
+        };
         DataflowResult {
             columns: cols,
             opaque,
+            inputs,
+            outputs,
+            engine,
         }
     }
 }

@@ -14,6 +14,19 @@ compiler reads straight from your source to build column-level lineage.
   (`@tw.sql(...)`, `@tw.task(...)`).
 - Adds **zero** runtime behaviour to your tasks.
 
+> **The decorator is optional.** trace-weaver also scans **plain Airflow DAGs** with
+> no annotation at all: it discovers `PythonOperator(python_callable=…)` callables and
+> SQL operators (`sql=`/`query=`), reads the SQL and the pandas/Spark body, and derives
+> column lineage on its own. Add a `@tw.task` only to *override* a spot it can't trace.
+>
+> ```bash
+> trace-weaver scan dags/ --service "Test Database" --database poc_db --schema public
+> ```
+>
+> (`--service/--database/--schema` expand bare table names to OpenMetadata FQNs when the
+> DAG has no `tw.configure(...)`.) See [`examples/dags/medallion.py`](examples/dags/medallion.py)
+> — a fully un-annotated DAG that scans to complete lineage.
+
 ## Install
 
 ```bash

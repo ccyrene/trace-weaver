@@ -58,6 +58,14 @@ struct ScanArgs {
     /// Default namespace for datasets without their own.
     #[arg(long, default_value = "default")]
     namespace: String,
+    /// Default OpenMetadata FQN parts for raw DAGs without `tw.configure(...)` —
+    /// they expand bare table names to `service.database.schema.table`.
+    #[arg(long)]
+    service: Option<String>,
+    #[arg(long)]
+    database: Option<String>,
+    #[arg(long)]
+    schema: Option<String>,
     /// Disable column-lineage inference from SQL.
     #[arg(long)]
     no_sql_infer: bool,
@@ -140,6 +148,9 @@ fn cmd_scan(a: ScanArgs) -> Result<()> {
         namespace: a.namespace,
         enable_sql_inference: !a.no_sql_infer,
         enable_code_inference: !a.no_code_infer,
+        service: a.service,
+        database: a.database,
+        schema: a.schema,
         ..Default::default()
     };
     let mut doc = scan_path(&a.path, &opts).context("scan failed")?;
