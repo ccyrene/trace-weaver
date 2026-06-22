@@ -12,10 +12,12 @@
 
 ## กฎเดียวที่ต้องจำ
 
-> **ชื่อ column เป็น literal (เขียนตรง ๆ ในโค้ด) + ที่มาอ้าง column ตรง ๆ → เครื่องอ่านเอง**
+> **ชื่อ column ที่รู้ตอน compile (string literal หรือ "ตัวแปรที่ถือ string คงที่") +
+> ที่มาอ้าง column ตรง ๆ → เครื่องอ่านเอง**
 >
-> ถ้าชื่อ column มาจาก *ค่าตอนรัน* (ตัวแปร, ข้อมูล, config) หรือ logic ซ่อนใน *ฟังก์ชัน/lambda* →
-> เครื่องอ่านไม่ได้ จะขึ้น `W_OPAQUE_COLUMN` ชี้บรรทัดให้ → ต้อง refactor หรือ declare
+> ถ้าชื่อ column มาจาก *ค่าตอนรัน* (ข้อมูล, config, argument, ผลลัพธ์ของฟังก์ชัน) หรือ logic
+> ซ่อนใน *ฟังก์ชัน/lambda* → เครื่องอ่านไม่ได้ จะขึ้น `W_OPAQUE_COLUMN` ชี้บรรทัดให้ →
+> ต้อง refactor หรือ declare
 
 ---
 
@@ -32,6 +34,7 @@ silver["full"]       = bronze.apply(lambda r: r["first"] + r["last"], axis=1)  #
 silver = silver.rename(columns={"amount": "amt"})        # rename:    amt <- amount
 silver = bronze.assign(net=bronze["amount"] - bronze["fee"])
 keep   = bronze[["event_id", "amount"]]                  # subset:    passthrough
+col = "is_valid"; silver[col] = bronze["amount"] > 0     # ชื่อ column จากตัวแปร string คงที่ → อ่านได้
 silver.to_sql("silver_sales", con=ENGINE)                # ← output = silver_sales
 
 # aggregate
@@ -62,7 +65,7 @@ gold.write.saveAsTable("gold_sales")
 **สรุปสิ่งที่อ่านได้:** `read_sql`/`read_sql_table`/`spark.read.table`/`spark.sql` (→ input) ·
 `to_sql`/`saveAsTable` (→ output) · `df["c"]=expr`, `withColumn`, `withColumnRenamed`,
 `select`/`selectExpr`, `rename(columns={...})`, `assign(...)`, `df[[...]]`, `groupby/agg`,
-`expr("...")`, และ loop เหนือ **list literal**.
+`expr("...")`, loop เหนือ **list literal**, และชื่อ column จาก **ตัวแปร string คงที่** (`col = "x"; out[col] = …`).
 
 ---
 
@@ -70,7 +73,7 @@ gold.write.saveAsTable("gold_sales")
 
 | ห้าม | ทำไมอ่านไม่ได้ |
 |---|---|
-| `out[col_var] = ...` (ชื่อ column มาจากตัวแปร) | ชื่อ column ไม่ใช่ literal — รู้ตอนรันเท่านั้น |
+| `out[runtime_col] = ...` (ชื่อ column มาจาก **ค่าตอนรัน**: ข้อมูล/config/arg/ผลฟังก์ชัน) | ชื่อ column รู้ตอนรันเท่านั้น *(แต่ `col = "x"; out[col] = …` ที่ `col` ถือ string คงที่ → อ่านได้แล้ว)* |
 | `out["c"] = df.apply(named_func, axis=1)` / `F.udf(...)` / `.rdd.map(...)` | logic อยู่ใน**ฟังก์ชันมีชื่อ/ภายนอก** เครื่องไม่เข้าไปอ่าน *(แต่ inline `lambda r: r["a"]+r["b"]` อ่านได้แล้ว)* |
 | `out = a.merge(b, on="k")` แล้วใช้ column ที่ไม่ใช่ key | ต้องรู้ schema ของทั้ง 2 ฝั่ง (ซึ่งไม่มี) |
 | `df.pivot(...)` / `melt` / `explode` / `stack` / `unstack` | ชื่อ column ผลลัพธ์ = **ค่าข้อมูล** ตอนรัน |
@@ -86,7 +89,6 @@ gold.write.saveAsTable("gold_sales")
 | ❌ แบบเดิม (opaque) | ✅ เขียนใหม่ (อ่านได้, ผลเหมือนเดิม) |
 |---|---|
 | `out["c"] = df.apply(my_udf, axis=1)` *(ฟังก์ชันมีชื่อ)* | inline ลง: `out["c"] = df.apply(lambda r: r["a"] + r["b"], axis=1)` หรือ vectorize `df["a"] + df["b"]` *(เร็วกว่า)* |
-| `col = "amount_usd"; out[col] = df["amount"] * 1.08` | `out["amount_usd"] = df["amount"] * 1.08` *(ใช้ชื่อ literal ตรง ๆ)* |
 | `for c in cols: out[c] = df[c]` *(cols เป็นตัวแปร)* | `for c in ["a", "b", "c"]: out[c] = df[c]` *(เขียน list ตรง ๆ)* |
 | `df.selectExpr("amount * 1.08")` *(ไม่มี AS)* | `df.selectExpr("amount * 1.08 AS amount_usd")` *(ใส่ `AS ชื่อ`)* |
 | `gold.agg(F.sum(col("amount")))` *(ไม่มีชื่อ)* | `gold.agg(F.sum(col("amount")).alias("total"))` *(ใส่ `.alias`)* |
@@ -126,7 +128,7 @@ def build_enriched():
 
 ## Checklist สั้น ๆ ก่อน merge
 
-1. ชื่อ column ทุกตัวที่สร้าง เป็น **string literal** ใช่ไหม (ไม่ใช่ตัวแปร/loop ที่ไม่ใช่ literal)
+1. ชื่อ column ทุกตัวที่สร้าง รู้ตอน compile ใช่ไหม — **string literal**, **ตัวแปรที่ถือ string คงที่** (`col = "x"`), หรือ loop เหนือ list literal (ไม่ใช่ค่าตอนรัน)
 2. ไม่มี UDF/ฟังก์ชัน**มีชื่อ**ที่ห่อ logic ของ column (`.apply(named_func)`, `.rdd`) — inline `lambda r: r["a"]+r["b"]` อ่านได้ แต่ vectorize เร็วกว่า
 3. Spark: aggregate ทุกตัวมี `.alias("ชื่อ")`; `selectExpr`/`expr` ที่ derive มี `AS ชื่อ`
 4. รัน `trace-weaver scan dags/` แล้ว **ไม่มี `W_OPAQUE_COLUMN`** (ถ้ามี → refactor ตามตาราง หรือ declare)

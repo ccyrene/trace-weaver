@@ -123,12 +123,14 @@ only its undeclared columns are inferred.
 `saveAsTable`; `df["c"]=expr`, arithmetic / cast / `.map` / comparisons; fan-in;
 `rename` / `assign` / `df[[...]]`; `withColumn` / `withColumnRenamed` / `select`
 / `selectExpr` / `expr()`; `groupby`/`agg`; literal-list loops; inline
-`apply(lambda …)`.
+`apply(lambda …)`; and column names from a **local string constant**
+(`col = "amount_usd"; out[col] = …`).
 
-**Opaque → `W_OPAQUE_COLUMN` (declare or refactor):** runtime-valued column
-names (`out[var]=…`, `df.columns=[...]`, `pivot`/`melt`/`explode`); named UDFs /
-`.rdd` / `.pipe`; join columns that aren't keys; SQL or loops built at runtime
-(f-strings / `.format`).
+**Opaque → `W_OPAQUE_COLUMN` (declare or refactor):** column names from a
+**runtime** value (`out[x]=…` where `x` isn't a compile-time constant;
+`df.columns=[...]`; `pivot`/`melt`/`explode`); named UDFs / `.rdd` / `.pipe`;
+join columns that aren't keys; SQL or loops built at runtime (f-strings /
+`.format`).
 
 The do/don't guide with per-case rewrites is in
 [`TRACEABLE_PIPELINES.md`](TRACEABLE_PIPELINES.md).

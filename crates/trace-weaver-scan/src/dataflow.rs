@@ -215,6 +215,11 @@ struct Analyzer<'a> {
     opaque: Vec<OpaqueNote>,
     /// (loop var, literal value) while unrolling `for c in ["a","b"]: …`.
     loop_subst: Option<(String, String)>,
+    /// Local string constants (`col = "amount_usd"`). A later `out[col] = …` or
+    /// `src[col]` resolves its column name from here — the name is known at
+    /// compile time, so it is traced, not flagged opaque. Reassigning the name to
+    /// a non-literal drops it.
+    str_vars: HashMap<String, String>,
     /// (row-lambda param, its frame's table) while reading an inline
     /// `df.apply(lambda r: …, axis=1)` — `r["x"]`/`r.x` are columns of that table.
     row_alias: Option<(String, Option<String>)>,
@@ -234,6 +239,7 @@ pub fn analyze(body: &[Stmt], consts: &HashMap<String, String>, source: &str) ->
         writes: HashMap::new(),
         opaque: Vec::new(),
         loop_subst: None,
+        str_vars: HashMap::new(),
         row_alias: None,
         inputs: Vec::new(),
         saw_spark: false,
@@ -319,15 +325,23 @@ impl<'a> Analyzer<'a> {
         });
     }
 
-    /// Resolve a subscript key to a column name: a string literal, or the current
-    /// unrolled loop variable substituted with its literal value.
+    /// Resolve a subscript key to a column name: a string literal, the current
+    /// unrolled loop variable, or a local string constant (`col = "amount_usd"`).
+    /// `None` when the key is a genuine runtime value (then the caller flags it).
     fn col_name(&self, e: &Expr) -> Option<String> {
         if let Some(s) = const_str(e) {
             return Some(s);
         }
-        if let (Expr::Name(n), Some((var, val))) = (e, &self.loop_subst) {
-            if n.id.as_str() == var {
-                return Some(val.clone());
+        if let Expr::Name(n) = e {
+            // A loop variable currently being unrolled wins; then a local string
+            // constant bound earlier in the body (`col = "amount_usd"`).
+            if let Some((var, val)) = &self.loop_subst {
+                if n.id.as_str() == var {
+                    return Some(val.clone());
+                }
+            }
+            if let Some(s) = self.str_vars.get(n.id.as_str()) {
+                return Some(s.clone());
             }
         }
         None
@@ -369,7 +383,21 @@ impl<'a> Analyzer<'a> {
                 }
             }
             // out = <rhs>   (binding / derivation)
-            Expr::Name(n) => self.bind(n.id.to_string(), value),
+            Expr::Name(n) => {
+                let name = n.id.to_string();
+                // Track local string constants (`col = "amount_usd"`) so a later
+                // `out[col] = …` / `src[col]` resolves to a literal column name
+                // instead of being flagged opaque — the name is known statically.
+                match const_str(value) {
+                    Some(s) => {
+                        self.str_vars.insert(name, s);
+                    }
+                    None => {
+                        self.str_vars.remove(&name); // reassigned to a non-literal
+                        self.bind(name, value);
+                    }
+                }
+            }
             // out.columns = [...]  — wholesale positional column rename; the new
             // names depend on the frame's current column order, which we don't track.
             Expr::Attribute(a) if a.attr.as_str() == "columns" => {
@@ -1478,6 +1506,59 @@ def f():
             r
         );
         assert!(r.columns.iter().all(|c| c.target != "score"));
+    }
+
+    #[test]
+    fn local_string_const_column_name_is_resolved() {
+        // `col = "amount_usd"; out[col] = …` — the column name is a compile-time
+        // string constant, so it must be traced, not flagged opaque. Also resolves
+        // on the SOURCE side (`b[name]`). (The exact case the user asked about.)
+        let src = r#"
+def f():
+    b = pd.read_sql("SELECT * FROM bronze", con=E)
+    out = pd.DataFrame()
+    col = "amount_usd"
+    out[col] = b["amount"] * 1.08
+    name = "event_id"
+    out[name] = b[name]
+    out.to_sql("silver")
+"#;
+        let r = run(src);
+        assert!(
+            r.opaque.is_empty(),
+            "string-const column names should trace cleanly: {:?}",
+            r.opaque
+        );
+        let usd = col(&r, "amount_usd");
+        assert_eq!(usd.sources, vec!["bronze.amount"]);
+        assert_eq!(usd.transform_type, TransformType::Transformation);
+        // `out[name] = b[name]` with name="event_id" — identity from the same column.
+        let ev = col(&r, "event_id");
+        assert_eq!(ev.sources, vec!["bronze.event_id"]);
+        assert_eq!(ev.transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn runtime_column_name_still_opaque() {
+        // A column name from a genuine runtime value (not a literal) must STILL be
+        // flagged opaque — we resolve compile-time constants, never guess.
+        let src = r#"
+def f():
+    b = pd.read_sql("SELECT * FROM bronze", con=E)
+    out = pd.DataFrame()
+    col = compute_name()
+    out[col] = b["amount"]
+    out.to_sql("silver")
+"#;
+        let r = run(src);
+        assert!(
+            r.opaque
+                .iter()
+                .any(|o| o.detail.contains("non-literal column name")),
+            "a runtime column name must stay opaque: {:?}",
+            r
+        );
+        assert!(r.columns.iter().all(|c| c.target != "amount"));
     }
 
     #[test]
