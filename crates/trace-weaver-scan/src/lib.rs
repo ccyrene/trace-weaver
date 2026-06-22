@@ -7,7 +7,9 @@
 //!    `@tw.task(...)` declaration into a [`python::TaskDecl`] (literals only —
 //!    no code execution).
 //! 2. The declaration's `inputs`/`outputs`/`column_map`/`sql` become datasets,
-//!    a job, and one or more edges (origin = **declared**).
+//!    a job, and one or more edges. Their origin is **declared** for a `@tw`
+//!    task, or **inferred** when the task was discovered decorator-free from a
+//!    raw operator (its very existence is a machine inference, not a human fact).
 //! 3. When `engine="sql"` and a `sql=` query is present, [`sql`] auto-extracts
 //!    column lineage to fill any columns the engineer didn't map by hand
 //!    (origin = **inferred from SQL**).
@@ -283,6 +285,16 @@ fn scan_decl(
     let inputs: Vec<String> = decl.inputs.iter().map(|n| expand_fqn(n, config)).collect();
     let outputs: Vec<String> = decl.outputs.iter().map(|n| expand_fqn(n, config)).collect();
 
+    // Decorator-free discovery (Pass B) infers the WHOLE task — its job, edges and
+    // datasets, not just its columns. Stamp those structural elements inferred so
+    // the IR never claims a discovered task was hand-declared; a `@tw` task keeps
+    // declared. (Column-level origin is set independently per mapping below.)
+    let element_origin = if decl.discovered {
+        discovered_origin(engine)
+    } else {
+        Origin::declared()
+    };
+
     // ── Hygiene diagnostics (findings #6, #10; I/O still required) ───────
     emit_decl_diagnostics(decl, engine, &inputs, &outputs, &loc, doc);
 
@@ -318,7 +330,7 @@ fn scan_decl(
 
     // 1. Upsert datasets for every input and output.
     for ds_name in inputs.iter().chain(outputs.iter()) {
-        doc.upsert_dataset(build_dataset(ds_name));
+        doc.upsert_dataset(build_dataset(ds_name, &element_origin));
     }
 
     // 2. Build the job. Tier 2: default the DAG from configure()/`with DAG(...)`.
@@ -335,7 +347,7 @@ fn scan_decl(
     job.sql = decl.sql.clone();
     job.inputs = inputs.clone();
     job.outputs = outputs.clone();
-    job.origin = Origin::declared();
+    job.origin = element_origin.clone();
     doc.jobs.push(job);
 
     // 3. Parse the SQL transform once (the INSERT targets a single table), and
@@ -406,7 +418,7 @@ fn scan_decl(
                 description: decl.description.clone(),
                 sql: decl.sql.clone(),
             };
-            edge.origin = Origin::declared();
+            edge.origin = element_origin.clone();
 
             for ce in &col_edges {
                 let attach = if ce.from_columns.is_empty() {
@@ -500,9 +512,25 @@ fn emit_decl_diagnostics(
     }
 }
 
+/// Provenance for the structural elements (job, edges, datasets) of a task
+/// recovered by decorator-FREE discovery (Pass B). Such a task was not authored
+/// by a human — the scanner inferred its very existence by statically reading a
+/// raw Airflow operator — so its job/edges/datasets are inferred too, mirroring
+/// the analyzer that produced them: SQL parsing (`engine="sql"`) vs. pandas/Spark
+/// code reading. A `@tw`-declared task keeps `Origin::declared()`.
+fn discovered_origin(engine: Engine) -> Origin {
+    let base = match engine {
+        Engine::Sql => Origin::inferred_sql(SQL_CONFIDENCE),
+        _ => Origin::inferred_code(CODE_DATAFLOW_CONFIDENCE),
+    };
+    base.with_note("discovered from a raw Airflow operator")
+}
+
 /// Build a dataset from an FQN, parsing the OpenMetadata parts when possible.
-fn build_dataset(fqn: &str) -> Dataset {
-    let mut ds = Dataset::new(fqn).with_origin(Origin::declared());
+/// `origin` is the provenance to stamp on it — declared for a `@tw` task,
+/// inferred for one recovered by decorator-free discovery.
+fn build_dataset(fqn: &str, origin: &Origin) -> Dataset {
+    let mut ds = Dataset::new(fqn).with_origin(origin.clone());
     if let Some(parts) = FqnParts::parse(fqn) {
         ds.fqn = Some(parts);
     }
@@ -1157,6 +1185,91 @@ def t2(): ...
             ab.column_lineage
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovered_tasks_mark_structural_origin_inferred() {
+        // A plain Airflow DAG (no @tw): a SQL operator + a pandas PythonOperator.
+        // Its jobs, edges AND datasets — not just its columns — must be tagged
+        // INFERRED, since the whole task was recovered by static analysis rather
+        // than hand-declared. Regression for the handoff bug where edge/job/dataset
+        // origin stayed "declared" even for decorator-free discovery.
+        let src = r#"
+from airflow import DAG
+BRONZE_SQL = "INSERT INTO bronze_sales (event_id) SELECT raw_id FROM landing_sales"
+def build_silver():
+    bronze = pd.read_sql("SELECT * FROM bronze_sales", con=E)
+    silver = pd.DataFrame()
+    silver["amount_usd"] = bronze["amount"] * 1.08
+    silver.to_sql("silver_sales", con=E)
+with DAG("medallion") as dag:
+    bronze = PostgresOperator(task_id="bronze", sql=BRONZE_SQL)
+    silver = PythonOperator(task_id="silver", python_callable=build_silver)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+
+        // Jobs: SQL-discovered -> inferred_sql; pandas-discovered -> inferred_code.
+        let bronze_job = doc.jobs.iter().find(|j| j.name == "bronze").unwrap();
+        assert_eq!(bronze_job.origin.source, OriginSource::InferredSql);
+        let silver_job = doc.jobs.iter().find(|j| j.name == "silver").unwrap();
+        assert_eq!(silver_job.origin.source, OriginSource::InferredCode);
+
+        // Every edge inherits its discovering task's inferred origin (none declared).
+        assert!(!doc.edges.is_empty());
+        assert!(
+            doc.edges.iter().all(|e| e.origin.is_inferred()),
+            "discovered edges must be inferred: {:?}",
+            doc.edges
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone(), e.origin.source))
+                .collect::<Vec<_>>()
+        );
+
+        // Datasets discovered from the operators are inferred, never stuck declared.
+        assert!(
+            doc.datasets.iter().all(|d| d.origin.is_inferred()),
+            "discovered datasets must be inferred: {:?}",
+            doc.datasets
+                .iter()
+                .map(|d| (d.name.clone(), d.origin.source))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn declared_task_keeps_declared_structural_origin() {
+        // Contrast: a hand-authored @tw task keeps DECLARED job/edge/dataset origin
+        // (only undeclared columns are inferred). Locks the discovered-vs-declared
+        // split so the fix above never bleeds into authored tasks.
+        let src = r#"
+import trace_weaver as tw
+@tw.task(
+    inputs=["s.d.p.a"],
+    outputs=["s.d.p.b"],
+    engine="sql",
+    sql="INSERT INTO b (x) SELECT x FROM a",
+)
+def t():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        assert!(
+            doc.jobs.iter().all(|j| !j.origin.is_inferred()),
+            "job declared"
+        );
+        assert!(
+            doc.edges.iter().all(|e| !e.origin.is_inferred()),
+            "edge declared"
+        );
+        assert!(
+            doc.datasets.iter().all(|d| !d.origin.is_inferred()),
+            "datasets declared"
+        );
+        // The undeclared column, however, IS inferred from SQL — edge.has_inferred()
+        // must still be true so exporters tag the column.
+        assert!(doc.edges.iter().all(|e| e.has_inferred()));
     }
 
     #[test]

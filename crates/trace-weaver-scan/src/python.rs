@@ -53,6 +53,12 @@ pub struct TaskDecl {
     /// Spots in the body the dataflow analyzer could not trace — surfaced as
     /// `W_OPAQUE_COLUMN` so the engineer knows exactly what to declare by hand.
     pub opaque: Vec<OpaqueNote>,
+    /// True when this declaration was synthesized by decorator-FREE discovery
+    /// (Pass B) from a raw Airflow operator, rather than authored via `@tw`. The
+    /// whole task — its job, edges and datasets, not just its columns — is then a
+    /// machine inference, so `scan_decl` stamps those structural elements with an
+    /// inferred `Origin` instead of declared.
+    pub discovered: bool,
 }
 
 /// Per-file defaults from a module-level `tw.configure(...)` call and/or a
@@ -239,6 +245,7 @@ fn build_operator_task(
             inferred_columns: r.columns,
             opaque: r.opaque,
             line,
+            discovered: true,
             ..Default::default()
         });
     }
@@ -257,6 +264,7 @@ fn build_operator_task(
             inputs: lineage.source_tables,
             outputs,
             line,
+            discovered: true,
             ..Default::default()
         });
     }
@@ -592,6 +600,8 @@ def build():
         assert_eq!(d.column_map[0].sources, vec!["x"]);
         assert_eq!(d.column_map[0].target, "a");
         assert!(d.line.is_some());
+        // Authored via @tw -> NOT a decorator-free discovery.
+        assert!(!d.discovered);
     }
 
     #[test]
@@ -763,5 +773,9 @@ with DAG("medallion") as dag:
             .inferred_columns
             .iter()
             .any(|c| c.target == "amount_usd"));
+
+        // Both were recovered decorator-free, so the flag is set — this is what
+        // drives the inferred job/edge/dataset origin in `scan_decl`.
+        assert!(bronze.discovered && silver.discovered);
     }
 }

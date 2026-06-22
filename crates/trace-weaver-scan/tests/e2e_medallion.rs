@@ -71,4 +71,25 @@ fn medallion_example_is_fully_traced_without_decorators() {
         .column_lineage
         .iter()
         .all(|c| c.origin.source == InferredSql));
+
+    // ── Structural provenance: with ZERO @tw, the jobs, edges AND datasets are
+    // all INFERRED — not just the columns. The IR must never claim a task that
+    // was discovered decorator-free was hand-declared.
+    assert!(
+        doc.jobs.iter().all(|j| j.origin.is_inferred()),
+        "all jobs inferred"
+    );
+    assert!(
+        doc.edges.iter().all(|e| e.origin.is_inferred()),
+        "all edges inferred"
+    );
+    assert!(
+        doc.datasets.iter().all(|d| d.origin.is_inferred()),
+        "all datasets inferred"
+    );
+    // Source matches the analyzer that recovered it: SQL operators -> inferred_sql,
+    // the pandas PythonOperator -> inferred_code.
+    assert_eq!(bronze.origin.source, InferredSql);
+    assert_eq!(silver.origin.source, InferredCode);
+    assert_eq!(gold.origin.source, InferredSql);
 }
