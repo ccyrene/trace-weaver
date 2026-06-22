@@ -416,4 +416,4 @@ def _self_check() -> bool:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    print("umap self-check:", "ok" if _self_check() else "FAILED")
+    print("trace-weaver self-check:", "ok" if _self_check() else "FAILED")

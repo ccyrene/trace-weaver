@@ -1,175 +1,259 @@
 # trace-weaver
 
-A tiny, **dependency-free** Python authoring SDK for declaring column-level data
-lineage on your Airflow tasks — the **trace-weaver** convention.
+**A static, column-level data-lineage compiler for Apache Airflow DAGs.**
 
-You annotate each data-producing task with `@tw.sql(...)` (SQL steps) or
-`@tw.task(...)` (pandas/Spark/python steps). The decorator is a **runtime
-no-op** (it returns your function unchanged, so your DAGs run exactly as before),
-but the arguments you pass are **statically parseable** literals that the trace-weaver
-compiler reads straight from your source to build column-level lineage.
+trace-weaver reads your DAG code **without executing it**, recovers
+column-level lineage, and compiles it into a single intermediate document
+(`*.weave.json`) that it can export to **OpenMetadata**, **OpenLineage** (Marquez
+& friends), or a **Graphviz DOT** graph.
 
-- Pure Python, **stdlib only**, Python **3.9+**.
-- Importable as `from trace_weaver import task, sql, configure` or `import trace_weaver as tw`
-  (`@tw.sql(...)`, `@tw.task(...)`).
-- Adds **zero** runtime behaviour to your tasks.
-
-> **The decorator is optional.** trace-weaver also scans **plain Airflow DAGs** with
-> no annotation at all: it discovers `PythonOperator(python_callable=…)` callables and
-> SQL operators (`sql=`/`query=`), reads the SQL and the pandas/Spark body, and derives
-> column lineage on its own. Add a `@tw.task` only to *override* a spot it can't trace.
->
-> ```bash
-> trace-weaver scan dags/ --service "Test Database" --database poc_db --schema public
-> ```
->
-> (`--service/--database/--schema` expand bare table names to OpenMetadata FQNs when the
-> DAG has no `tw.configure(...)`.) See [`examples/dags/medallion.py`](examples/dags/medallion.py)
-> — a fully un-annotated DAG that scans to complete lineage.
-
-## Install
-
-```bash
-cd python
-pip install -e .
+```
+DAG code (.py)  ──scan──▶  weave IR (.weave.json)  ──export──▶  OpenMetadata
+                  │                                              OpenLineage
+              (no exec)                                          Graphviz DOT
 ```
 
-Or just put the `trace_weaver/` package on your `PYTHONPATH` — it has no dependencies.
+The compiler is written in Rust (a Cargo workspace); a tiny, dependency-free
+**Python authoring SDK** (`trace_weaver`) is included for the cases where you
+want to *declare* lineage by hand. The SDK is optional — see below.
 
-## 30-second usage
+---
+
+## Highlights
+
+- **Works on plain Airflow DAGs with zero annotation.** trace-weaver discovers
+  tasks from raw operators — `PythonOperator(python_callable=…)` and SQL
+  operators (`sql=`/`query=`) — then reads the embedded SQL and the pandas/Spark
+  function body to derive column lineage on its own.
+- **Auto-infer first, declare only the tail.** Column lineage is extracted from
+  SQL (parsed) and from pandas/Spark dataflow (statically traced). You annotate
+  only the spots the analyzer genuinely cannot read.
+- **Provenance is first-class.** Every dataset, job, edge and column mapping
+  records whether it was **declared** by a human or **inferred** by the compiler
+  (and how). Exporters visibly tag inferred lineage so a guess is never mistaken
+  for a hand-declared fact.
+- **Nothing is silently dropped.** A pattern the analyzer can't trace becomes a
+  precise `W_OPAQUE_COLUMN` diagnostic pointing at the line — not a missing edge.
+- **Static & reproducible.** No DAG is ever run; no network call is made during a
+  scan. The compiled document is deterministic.
+
+---
+
+## Quick start
+
+```bash
+# Build the compiler (produces target/release/trace-weaver).
+cargo build --release
+
+# Scan a plain Airflow DAG (no @tw needed). --service/--database/--schema expand
+# bare table names into OpenMetadata FQNs (service.database.schema.table).
+trace-weaver scan examples/dags \
+  --service "Test Database" --database poc_db --schema public \
+  -o build/lineage.weave.json --strict
+
+# Inspect / validate the compiled document.
+trace-weaver validate build/lineage.weave.json
+
+# Export.
+trace-weaver export --to openmetadata --dry-run build/lineage.weave.json
+trace-weaver export --to openlineage  -o build/events.json build/lineage.weave.json
+trace-weaver graph  build/lineage.weave.json -o build/lineage.dot   # → DOT
+```
+
+[`examples/dags/medallion.py`](examples/dags/medallion.py) is a fully
+un-annotated `landing → bronze → silver → gold` DAG. Scanning it yields
+**4 datasets · 3 edges · 17 column mappings · 0 diagnostics** — bronze & gold
+inferred from SQL, silver inferred from the pandas body.
+
+---
+
+## How it works
+
+A Cargo workspace, one concern per crate:
+
+| Crate                  | Responsibility |
+|------------------------|----------------|
+| `trace-weaver-core`    | The weave IR (`WeaveDocument` / `Dataset` / `Job` / `Edge` / `ColumnEdge`), the `Origin` provenance type, graph helpers, and structural validation. Aligned with the OpenLineage spec. |
+| `trace-weaver-scan`    | DAG code → IR. AST parsing (`python.rs`), SQL column lineage (`sql.rs`), pandas/Spark dataflow analysis (`dataflow.rs`), same-name gap-fill (`infer.rs`). |
+| `trace-weaver-export`  | IR → catalogues: `openmetadata.rs`, `openlineage.rs`, `dot.rs`. One `export(target, doc, &cfg)` entry point. |
+| `trace-weaver-cli`     | The `trace-weaver` binary: `scan` / `validate` / `export` / `graph`. |
+
+**Scan pipeline** (per file, literals only — no code is executed):
+
+1. Parse the source AST (`rustpython-parser`).
+2. **Discover tasks.** (A) `@tw.task` / `@tw.sql` decorated functions, and
+   (B) decorator-free raw Airflow operators. A `@tw` decorator on a function
+   *overrides* its decorator-free discovery (deduped by name).
+3. For SQL steps, parse the query for column lineage (`inferred from SQL`).
+4. For pandas/Spark steps, statically trace the function body
+   (`inferred from code`); fill remaining same-name gaps by identity.
+5. Finalize: back-fill dataset schemas from observed columns, flag any
+   data-producing edge that ended up with no column lineage
+   (`W_NO_COLUMN_LINEAGE`), and run structural validation.
+
+---
+
+## Provenance: declared vs. inferred
+
+The compiler treats your declarations as the source of truth and only *fills
+gaps*. Every element carries an `Origin`:
+
+| Tier            | Source | ~confidence | When |
+|-----------------|--------|:-----------:|------|
+| **Declared**    | a human, in a `@tw.task(...)` `column_map` | — (authoritative) | never overwritten |
+| **Inferred from SQL**  | parsing an embedded SQL query  | `0.85` | `engine="sql"` + a query is present |
+| **Inferred from code** | statically tracing a pandas/Spark body | `0.70` | `df["c"]=…`, `withColumn`, `select`, `groupby/agg`, `rename`, `expr("…")`, … |
+| _(identity gap-fill)_  | conservative same-name passthrough     | `0.40` | a target column sharing a name with an undeclared input column |
+
+Exporters append `(inferred from SQL)` / `(inferred from code)` to inferred
+labels, so a human reading the lineage can always tell declared truth from a
+machine guess.
+
+On a **plain (un-annotated) DAG**, the lineage is inferred top to bottom: not
+only the columns but the **datasets, jobs and edges themselves** are tagged
+inferred — because their very existence was recovered by static analysis, not
+hand-declared. A `@tw`-declared task, by contrast, keeps a `declared` origin and
+only its undeclared columns are inferred.
+
+---
+
+## What the scanner reads automatically (and what it can't)
+
+**Auto (no annotation):** SQL operators; `read_sql`/`to_sql`/`spark.read.table`/
+`saveAsTable`; `df["c"]=expr`, arithmetic / cast / `.map` / comparisons; fan-in;
+`rename` / `assign` / `df[[...]]`; `withColumn` / `withColumnRenamed` / `select`
+/ `selectExpr` / `expr()`; `groupby`/`agg`; literal-list loops; inline
+`apply(lambda …)`.
+
+**Opaque → `W_OPAQUE_COLUMN` (declare or refactor):** runtime-valued column
+names (`out[var]=…`, `df.columns=[...]`, `pivot`/`melt`/`explode`); named UDFs /
+`.rdd` / `.pipe`; join columns that aren't keys; SQL or loops built at runtime
+(f-strings / `.format`).
+
+The do/don't guide with per-case rewrites is in
+[`TRACEABLE_PIPELINES.md`](TRACEABLE_PIPELINES.md).
+
+---
+
+## CLI reference
+
+```text
+trace-weaver scan <path> [-o out.weave.json] [--namespace NS]
+                         [--service S --database D --schema SC]
+                         [--no-sql-infer] [--no-code-infer] [--strict]
+trace-weaver validate <doc.weave.json> [--strict]
+trace-weaver export --to <openmetadata|openlineage|dot> <doc.weave.json>
+                    [--dry-run] [-o out] [--om-host URL]
+                    [--om-token T | --om-token-file PATH] [--om-service S]
+                    [--ol-producer URI] [--timeout S] [--retries N]
+                    [--fail-on-partial]
+trace-weaver graph <doc.weave.json> [-o out.dot]      # shortcut for export --to dot
+```
+
+- **`scan`** walks a file or directory of `.py` DAGs and writes the weave IR.
+  `--service/--database/--schema` supply OpenMetadata FQN parts for DAGs without
+  a `tw.configure(...)`. `--no-sql-infer` / `--no-code-infer` disable a tier.
+- **`validate`** runs structural checks (unknown datasets, duplicate names,
+  off-endpoint columns, …).
+- **`export`** sends the document to a catalogue. `--dry-run` builds the request
+  bodies / artifact and performs **no** network I/O.
+- **Exit codes:** `0` success; `1` on error or a tripped `--strict` /
+  `--fail-on-partial` gate.
+- **OpenMetadata auth:** the ingestion-bot JWT is read from `--om-token-file`,
+  then `--om-token`, then the `OPENMETADATA_BOT_TOKEN` environment variable.
+  Prefer the file or env var — a raw `--om-token` is visible in your shell
+  history.
+
+### Export targets
+
+- **`openmetadata`** (`om`) — PUTs `add_lineage` edges (with per-column
+  `columnsLineage` and `function` labels) to `{host}/v1/lineage`; prints the
+  request bodies under `--dry-run`.
+- **`openlineage`** (`ol`) — emits `COMPLETE` `RunEvent`s carrying the
+  `columnLineage` dataset facet, as a JSON array (file-only).
+- **`dot`** (`graphviz`) — a Graphviz DOT graph; edges with any inferred lineage
+  are drawn dashed/orange.
+
+---
+
+## Optional: the Python authoring SDK (`@tw`)
+
+You rarely need it — the compiler infers lineage from SQL and pandas/Spark code.
+Reach for the SDK only to **declare** a column the analyzer flagged opaque, or to
+attach a description/transform label. The decorator is a **runtime no-op**: it
+returns your function unchanged, so your DAGs run exactly as before.
+
+```bash
+cd python && pip install -e .        # stdlib only, Python 3.9+
+```
 
 ```python
 import trace_weaver as tw
 
-# Once per file — sets FQN + dag defaults so you can use bare table names below.
+# Per-file defaults: FQN parts + dag, so you can use bare table names below.
 tw.configure(service="Test Database", database="poc_db", schema="public",
-               dag="medallion_lineage")
+             dag="medallion_lineage")
 
-# Module-level SQL constant — the scanner resolves the `sql` ref to this text.
-BRONZE_SQL = """
-    SELECT
-        CAST(raw_event_id AS BIGINT) AS event_id,
-        ROUND(amount * fx_rate, 2)   AS amount_usd
-    FROM landing_sales
-"""
+BRONZE_SQL = "SELECT CAST(raw_event_id AS BIGINT) AS event_id FROM landing_sales"
 
-# SQL step — column lineage is auto-derived from the query, no column_map needed.
-@tw.sql(
-    BRONZE_SQL,                         # str literal OR a name of a module-level str const
-    inputs=["landing_sales"],           # bare names → expanded to the configured FQN
-    outputs=["bronze_sales"],
-    description="### Bronze build\nCleans + casts landing rows.",
-    transform="CAST / DEDUPE",
-)
+# SQL step — column lineage auto-derived from the query (no column_map needed).
+@tw.sql(BRONZE_SQL, inputs=["landing_sales"], outputs=["bronze_sales"],
+        transform="CAST / DEDUPE")
 def build_bronze():
-    ...  # your normal Airflow task body; runs unchanged
-```
+    ...
 
-`engine=` is optional (inferred as `sql` from the query); `dag=` comes from
-`configure(...)`. For a pandas/Spark/python step, use `@tw.task(...)` with a
-`column_map` — the compiler can't trace that dataflow:
-
-```python
+# pandas/Spark step — declare only the columns the analyzer can't trace.
 @tw.task(
     inputs=["bronze_sales"],
     outputs=["silver_sales"],
     column_map=[
-        # (sources, target, function)  — bare column names
+        # (sources, target, function); sources may be a bare string for one source
         (["amount", "currency"], "amount_usd", "ROUND(amount * fx[currency], 2)"),
     ],
+    copy=["event_id", "customer_name"],   # same-name passthrough → declared identity
 )
 def build_silver():
     ...
 ```
 
-## Dataset FQNs
-
-Datasets use OpenMetadata style `service.database.schema.table`. The **service**
-segment may contain spaces, e.g. `"Test Database.poc_db.public.bronze_sales"`.
-
-With `tw.configure(service=…, database=…, schema=…)` set you write **bare table
-names** (`"landing_sales"`) and the scanner expands them to the full FQN. Names
-that already contain a `.` are passed through unchanged, so you can mix bare and
-fully-qualified names — handy for multi-source pipelines (e.g. an S3 input and a
-Redshift output in the same task). `inputs=` / `outputs=` also accept the
-`Dataset` helper (sugar):
-
-```python
-import trace_weaver as tw
-from trace_weaver import task, Dataset
-
-tw.configure(service="Test Database", database="poc_db", schema="public")
-
-@tw.sql(
-    "SELECT raw_event_id AS event_id FROM landing_sales",
-    inputs=[Dataset("landing_sales")],          # bare or full FQN; both work
-    outputs=[Dataset("bronze_sales")],
-)
-def build_bronze():
-    ...
-```
-
-Keep these literal (one string per `Dataset(...)`) so the static scanner can read
-them without executing your code.
-
-## Provenance: declared vs. inferred
-
-The compiler treats your declarations as the source of truth and only *fills gaps*:
-
-1. **`column_map` entries are DECLARED** — authoritative, never overwritten.
-2. If `engine="sql"` and `sql=...` is present, the compiler **parses the SQL** to
-   auto-derive lineage for any target column *not* already in `column_map`
-   (tagged *inferred from SQL*).
-3. For `pandas`/`spark`/`python` tasks the compiler **statically reads the function
-   body** and traces column flow (`df["c"] = df["a"] * 2`, `withColumn`, `select`,
-   `groupby/agg`, `rename`, `expr("…")`, …), tagged *inferred from code* (≈`0.7`).
-   A conservative same-name identity gap-fill (≈`0.4`) fills anything still missing.
-
-Exporters append `(inferred from SQL)` / `(inferred from code)` to inferred
-labels, so a human can always tell declared truth from a machine guess.
-
-> **You usually don't need a `column_map` anymore** — the compiler derives column
-> lineage from the SQL and the pandas/Spark body. Patterns it can't read statically
-> (dynamic column names, named UDFs / `.rdd`, joins, pivots) raise `W_OPAQUE_COLUMN` with
-> the exact line; refactor to a traceable form or declare just that column. See
-> [`TRACEABLE_PIPELINES.md`](TRACEABLE_PIPELINES.md) for the do/don't guide.
-
-## Decorator reference
-
-`@task(dag=None, inputs=None, outputs=None, engine=None, sql=None,
-description=None, transform=None, column_map=None, copy=None, **kwargs)`
+**Decorator reference** — `@task(dag=None, inputs=None, outputs=None,
+engine=None, sql=None, description=None, transform=None, column_map=None,
+copy=None, **kwargs)`:
 
 | arg           | type                              | notes |
 |---------------|-----------------------------------|-------|
-| `dag`         | `str`                             | DAG / pipeline id |
-| `inputs`      | `list[str | Dataset]`             | source dataset FQNs |
-| `outputs`     | `list[str | Dataset]`             | output dataset FQNs |
+| `dag`         | `str`                             | DAG / pipeline id (falls back to `configure(dag=)` or a `with DAG(...)` block) |
+| `inputs`      | `list[str \| Dataset]`            | source dataset FQNs (bare names expand via `configure`) |
+| `outputs`     | `list[str \| Dataset]`            | output dataset FQNs |
 | `engine`      | `"sql"\|"pandas"\|"spark"\|"python"\|"bash"` | optional; inferred (`sql` if a query is present, else `python`). Unknown values tolerated |
 | `sql`         | `str` or module-level const name  | parsed when `engine="sql"` |
 | `description` | `str` or const name               | rich (markdown) edge description |
 | `transform`   | `str`                             | short transform-kind label |
-| `column_map`  | `list[(sources, target, function)]` | declared, authoritative lineage; `sources` may be a list **or a bare string** for a single source |
-| `copy`        | `list[str]`                       | same-name passthrough columns — each a declared identity (`"direct copy"`); `column_map` wins on conflict |
+| `column_map`  | `list[(sources, target, function)]` | declared, authoritative lineage; `sources` may be a list **or a bare string** |
+| `copy`        | `list[str]`                       | same-name passthrough columns — each a declared identity; `column_map` wins on conflict |
 | `**kwargs`    | anything                          | tolerated & recorded for forward-compat |
 
+`@tw.sql(QUERY, ...)` is sugar for `@task(engine="sql", sql=QUERY, ...)`.
 `inputs` + `outputs` are the meaningful minimum; everything else is optional.
-`engine` is **inferred** (`sql` when a `sql=`/query is present, else `python`),
-and `dag` falls back to `tw.configure(dag=…)` or a surrounding `with DAG(...)`
-block — so you rarely pass either. A bare `@task` (no parentheses) is also
-accepted and is likewise a no-op.
+Datasets use OpenMetadata style `service.database.schema.table` (the *service*
+segment may contain spaces). Every declaration is also appended to `tw.registry`
+(a `list[trace_weaver.Declaration]`) for optional runtime introspection — the
+decorator's only side effect.
 
-`@tw.sql(QUERY, ...)` is sugar for `@task(engine="sql", sql=QUERY, ...)`; on a
-SQL step the compiler auto-derives column lineage from the query, so `column_map`
-is optional there (any entries you do declare win, the rest are inferred from the
-SQL). `tw.configure(service=…, database=…, schema=…, dag=…)` sets per-file
-defaults used to expand bare table names and supply the `dag`.
+---
 
-### Runtime introspection (optional)
+## Build, test & lint
 
-Every declaration is appended to `tw.registry` (a `list[trace_weaver.Declaration]`).
-This is the decorator's only side effect and never changes behaviour — handy if
-you want to inspect declarations in a running process.
+```bash
+cargo build --release                                            # → target/release/trace-weaver
+cargo test --workspace                                           # Rust test suite
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo fmt --all --check
+ruff check python examples                                       # Python SDK + examples
+```
+
+Rust 2021 edition, MSRV 1.80.
 
 ## License
 
-Apache-2.0.
+Apache-2.0. See [`LICENSE`](LICENSE).
