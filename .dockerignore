@@ -1,0 +1,36 @@
+# Keep the build context small and reproducible. Anything not needed to compile
+# scratch/test material is excluded so `docker build` ships less data to the daemon.
+
+# Rust build artifacts (rebuilt inside the builder stage)
+target/
+**/*.rs.bk
+
+# Compiler output / scratch
+build/
+scratch_probe/
+
+# Docker e2e harness transient artifacts (the e2e build lives under docker/)
+docker/recorded.json
+docker/om_sent.json
+docker/lineage.weave.json
+
+# Version control
+.git
+.gitignore
+
+# Python caches (DAGs are mounted at runtime, not built into the image)
+**/__pycache__
+*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+
+# Editor / OS / tooling
+.DS_Store
+*.swp
+.claude/
+.dockerignore
+Dockerfile
+docs/
+README.md

@@ -1,0 +1,28 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Compiler output / scratch
+/build
+
+# Docker e2e transient artifacts
+docker/recorded.json
+docker/om_sent.json
+docker/lineage.weave.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+
+# Editor / OS
+.DS_Store
+*.swp
+
+# Claude Code scheduler lock
+.claude/scheduled_tasks.lock
+
+# Ad-hoc scanner probe scripts (manual experiments; not part of the test suite)
+/scratch_probe

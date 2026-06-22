@@ -1,0 +1,165 @@
+# CI for the trace-weaver data-lineage compiler.
+# lint -> rustfmt + clippy; test -> workspace tests; docker -> root-image build + --version smoke + image CVE scan.
+# Security gates: gitleaks (secrets, full history), hadolint (Dockerfile), trivy (fs vuln/secret/misconfig + image CVE).
+# Cargo caches (~/.cargo + target) are keyed on Cargo.lock. Runs on push/PR to main; superseded runs cancel.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref when a newer commit lands.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable + rustfmt + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+            ${{ runner.os }}-cargo-
+
+      - name: rustfmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: Test (workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
+      - name: cargo test
+        run: cargo test --workspace --all-features
+
+  docker:
+    name: Docker (build + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image (no push)
+        run: docker build -t trace-weaver:ci .
+
+      - name: Smoke test (--version)
+        run: docker run --rm trace-weaver:ci --version
+
+      # Observe-mode: scans + reports HIGH/CRITICAL image CVEs but does not fail
+      # the build (exit-code 0). Flip to exit-code "1" once a clean baseline is
+      # triaged into .trivyignore. trivy-action@v0.36.0 pins setup-trivy by SHA
+      # (older tag-pinned releases broke when setup-trivy tags were deleted).
+      - name: Trivy image scan (observe-mode; HIGH,CRITICAL; unfixed ignored)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: trace-weaver:ci
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+          trivyignores: .trivyignore
+
+  secrets:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so gitleaks scans every commit
+
+      - name: Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+
+  dockerfile-lint:
+    name: Dockerfile lint (hadolint)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          config: .hadolint.yaml
+
+  trivy-fs:
+    name: Vuln & config scan (trivy fs)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Observe-mode (exit-code 0): scans + reports but does not fail the build.
+      # Flip to "1" once a clean baseline is triaged into .trivyignore.
+      - name: Trivy filesystem scan (observe-mode; vuln + secret + misconfig)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "0"
+          trivyignores: .trivyignore
+
+  python-lint:
+    name: Python SDK lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ruff
+        run: pip install --quiet ruff==0.6.9
+
+      - name: ruff check (lint only; no format enforcement)
+        run: ruff check python examples

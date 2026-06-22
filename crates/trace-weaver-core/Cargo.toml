@@ -1,0 +1,13 @@
+[package]
+name = "trace-weaver-core"
+description = "weave universal lineage model: types, serde, provenance, validation, graph."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+indexmap.workspace = true

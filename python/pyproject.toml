@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trace-weaver"
+version = "0.1.0"
+description = "Tiny, dependency-free authoring SDK for declaring statically-parseable column-level data lineage on Airflow tasks (the trace-weaver convention)."
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "trace-weaver" },
+]
+keywords = ["lineage", "airflow", "openmetadata", "data-lineage", "trace-weaver", "weave"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Intended Audience :: Developers",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ccyrene/trace-weaver"
+Source = "https://github.com/ccyrene/trace-weaver"
+
+[tool.setuptools]
+packages = ["trace_weaver"]
+
+[tool.setuptools.package-data]
+trace_weaver = ["py.typed"]

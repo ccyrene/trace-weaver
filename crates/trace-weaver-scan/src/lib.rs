@@ -1,0 +1,1046 @@
+//! # trace-weaver-scan
+//!
+//! Turns annotated Python DAG code into a [`WeaveDocument`].
+//!
+//! Pipeline per file:
+//! 1. [`python`] parses the source (rustpython-parser) and extracts every
+//!    `@tw.task(...)` declaration into a [`python::TaskDecl`] (literals only —
+//!    no code execution).
+//! 2. The declaration's `inputs`/`outputs`/`column_map`/`sql` become datasets,
+//!    a job, and one or more edges (origin = **declared**).
+//! 3. When `engine="sql"` and a `sql=` query is present, [`sql`] auto-extracts
+//!    column lineage to fill any columns the engineer didn't map by hand
+//!    (origin = **inferred from SQL**).
+//! 4. [`infer`] applies best-effort code heuristics to fill remaining gaps
+//!    (origin = **inferred from code**).
+//!
+//! Declared facts always win; inference only fills gaps and is tagged so
+//! exporters can render `(inferred …)` next to it.
+
+use std::path::Path;
+
+use trace_weaver_core::{
+    ColumnEdge, ColumnRef, Dataset, Diagnostic, Edge, Engine, FqnParts, Job, Origin, SourceLoc,
+    Transform, TransformType, WeaveDocument,
+};
+
+use crate::python::{ColumnMapEntry, ModuleConfig, TaskDecl};
+use crate::sql::{SqlColRef, SqlMapping};
+
+pub mod infer;
+pub mod python;
+pub mod sql;
+
+/// Knobs controlling a scan.
+#[derive(Debug, Clone)]
+pub struct ScanOptions {
+    /// Default document namespace for datasets that don't specify one.
+    pub namespace: String,
+    /// `producer` string written into the document.
+    pub producer: String,
+    /// Auto-extract column lineage from embedded SQL.
+    pub enable_sql_inference: bool,
+    /// Best-effort code analysis (pandas/Spark) to fill undeclared gaps.
+    pub enable_code_inference: bool,
+}
+
+impl Default for ScanOptions {
+    fn default() -> Self {
+        ScanOptions {
+            namespace: "default".to_string(),
+            producer: concat!("trace-weaver/", env!("CARGO_PKG_VERSION")).to_string(),
+            enable_sql_inference: true,
+            enable_code_inference: true,
+        }
+    }
+}
+
+/// Confidence assigned to SQL-inferred column lineage.
+const SQL_CONFIDENCE: f32 = 0.85;
+
+/// Recursively scan every `*.py` file under `root` and assemble one document.
+///
+/// After collecting all files this derives any missing job-level edges,
+/// runs structural validation, and folds the findings into
+/// `document.diagnostics`.
+pub fn scan_path(root: &Path, opts: &ScanOptions) -> anyhow::Result<WeaveDocument> {
+    let mut doc = WeaveDocument::new(opts.namespace.clone(), opts.producer.clone());
+
+    for entry in walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("py") {
+            continue;
+        }
+        let path_str = path.display().to_string();
+        let source = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                doc.diagnostics.push(
+                    Diagnostic::error("E_READ", format!("could not read {path_str}: {e}"))
+                        .at(SourceLoc::new(path_str.clone(), None)),
+                );
+                continue;
+            }
+        };
+        // Per-file errors are collected as diagnostics; one bad file must not
+        // abort the whole scan.
+        if let Err(e) = scan_source(&path_str, &source, opts, &mut doc) {
+            doc.diagnostics.push(
+                Diagnostic::error("E_PARSE", format!("failed to scan {path_str}: {e}"))
+                    .at(SourceLoc::new(path_str.clone(), None)),
+            );
+        }
+    }
+
+    doc.derive_edges_from_jobs();
+
+    // Cross-job finalisation: back-fill schemas from observed columns, run code
+    // inference to fill remaining gaps, and flag edges with no column lineage.
+    finalize(&mut doc, opts);
+
+    let validation = trace_weaver_core::validate(&doc);
+    doc.diagnostics.extend(validation);
+
+    Ok(doc)
+}
+
+/// Post-pass over the whole document (findings #3 / #11): once every job has been
+/// scanned, datasets know their observed columns, code inference can fill
+/// same-named gaps, and we can flag data-producing edges that ended up with no
+/// column lineage at all.
+fn finalize(doc: &mut WeaveDocument, opts: &ScanOptions) {
+    backfill_schemas(doc);
+
+    if opts.enable_code_inference {
+        code_inference_pass(doc);
+    }
+
+    // An edge carrying zero column lineage is the real, detectable gap (e.g. a
+    // pandas/Spark task with no `column_map`). This is the actionable warning —
+    // engineers should declare a `column_map` for it.
+    let mut warnings = Vec::new();
+    for e in &doc.edges {
+        if e.column_lineage.is_empty() {
+            let loc = e
+                .job
+                .as_ref()
+                .and_then(|jid| doc.jobs.iter().find(|j| &j.id == jid))
+                .and_then(|j| j.location.clone());
+            let from = e.from.rsplit('.').next().unwrap_or(&e.from);
+            let to = e.to.rsplit('.').next().unwrap_or(&e.to);
+            let mut d = Diagnostic::warn(
+                "W_NO_COLUMN_LINEAGE",
+                format!(
+                    "edge {from} -> {to} has no column-level lineage; declare a column_map \
+                     (only SQL transforms are auto-extracted)"
+                ),
+            );
+            if let Some(l) = loc {
+                d = d.at(l);
+            }
+            warnings.push(d);
+        }
+    }
+    doc.diagnostics.extend(warnings);
+}
+
+/// Merge the columns observed on edges into each dataset's `schema`, so the
+/// document records known columns and `validate()`'s column checks become live.
+fn backfill_schemas(doc: &mut WeaveDocument) {
+    use std::collections::BTreeMap;
+    let mut cols: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let note = |ds: &str, col: &str, m: &mut BTreeMap<String, Vec<String>>| {
+        let v = m.entry(ds.to_string()).or_default();
+        if !v.iter().any(|c| c == col) {
+            v.push(col.to_string());
+        }
+    };
+    for e in &doc.edges {
+        for ce in &e.column_lineage {
+            note(&ce.to_column.dataset, &ce.to_column.column, &mut cols);
+            for fc in &ce.from_columns {
+                note(&fc.dataset, &fc.column, &mut cols);
+            }
+        }
+    }
+    for (ds_name, columns) in cols {
+        if let Some(ds) = doc.dataset_mut(&ds_name) {
+            for c in columns {
+                if !ds.schema.iter().any(|f| f.name == c) {
+                    ds.schema.push(trace_weaver_core::Field::new(c));
+                }
+            }
+        }
+    }
+}
+
+/// Best-effort identity gap-fill (origin = inferred_code) for output columns that
+/// share a name with an input column but weren't mapped on that edge.
+fn code_inference_pass(doc: &mut WeaveDocument) {
+    let datasets: std::collections::HashMap<String, Dataset> = doc
+        .datasets
+        .iter()
+        .map(|d| (d.name.clone(), d.clone()))
+        .collect();
+    for edge in &mut doc.edges {
+        let already: Vec<String> = edge
+            .column_lineage
+            .iter()
+            .map(|c| c.to_column.column.clone())
+            .collect();
+        let (src, tgt) = match (datasets.get(&edge.from), datasets.get(&edge.to)) {
+            (Some(s), Some(t)) => (s, t),
+            _ => continue,
+        };
+        for ce in infer::infer_identity_gap_fill(&[src], tgt, &already) {
+            edge.column_lineage.push(ce);
+        }
+    }
+}
+
+/// Scan a single Python source string into `doc` (used directly in tests).
+pub fn scan_source(
+    path: &str,
+    source: &str,
+    opts: &ScanOptions,
+    doc: &mut WeaveDocument,
+) -> anyhow::Result<()> {
+    let module = python::extract_task_decls(source)?;
+    for decl in &module.tasks {
+        scan_decl(path, decl, &module.config, opts, doc);
+    }
+    Ok(())
+}
+
+/// Expand a bare table name into a full FQN using the module's `configure(...)`
+/// defaults. Names that already contain a `.` (assumed to be fuller paths/FQNs)
+/// are left untouched; bare names are prefixed `service.database.schema.` only
+/// when all three defaults are present.
+fn expand_fqn(name: &str, config: &ModuleConfig) -> String {
+    if name.contains('.') {
+        return name.to_string();
+    }
+    match (&config.service, &config.database, &config.schema) {
+        (Some(s), Some(d), Some(sc)) => format!("{s}.{d}.{sc}.{name}"),
+        _ => name.to_string(),
+    }
+}
+
+/// Turn one task declaration into datasets + a job + edges with column lineage.
+fn scan_decl(
+    path: &str,
+    decl: &TaskDecl,
+    config: &ModuleConfig,
+    opts: &ScanOptions,
+    doc: &mut WeaveDocument,
+) {
+    let loc = SourceLoc::new(path, decl.line);
+
+    // Tier 1: infer the engine when omitted — `sql` if a query is present,
+    // otherwise `python` (we no longer require an explicit engine=).
+    let engine = match &decl.engine {
+        Some(e) => Engine::from_str_loose(e),
+        None if decl.sql.is_some() => Engine::Sql,
+        None => Engine::Python,
+    };
+
+    // Tier 1: expand bare table names into full FQNs via configure() defaults.
+    let inputs: Vec<String> = decl.inputs.iter().map(|n| expand_fqn(n, config)).collect();
+    let outputs: Vec<String> = decl.outputs.iter().map(|n| expand_fqn(n, config)).collect();
+
+    // ── Hygiene diagnostics (findings #6, #10; I/O still required) ───────
+    emit_decl_diagnostics(decl, engine, &inputs, &outputs, &loc, doc);
+
+    // 1. Upsert datasets for every input and output.
+    for ds_name in inputs.iter().chain(outputs.iter()) {
+        doc.upsert_dataset(build_dataset(ds_name));
+    }
+
+    // 2. Build the job. Tier 2: default the DAG from configure()/`with DAG(...)`.
+    let dag = decl
+        .dag
+        .clone()
+        .or_else(|| config.dag.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let job_id = format!("{dag}.{}", decl.task_name);
+    let mut job = Job::new(job_id.clone(), decl.task_name.clone(), engine);
+    job.dag = Some(dag);
+    job.location = Some(loc.clone());
+    job.description = decl.description.clone();
+    job.sql = decl.sql.clone();
+    job.inputs = inputs.clone();
+    job.outputs = outputs.clone();
+    job.origin = Origin::declared();
+    doc.jobs.push(job);
+
+    // 3. Parse the SQL transform once (the INSERT targets a single table), and
+    //    surface diagnostics for projections we refuse to map (findings #1/#2).
+    let sql_lineage = if opts.enable_sql_inference && engine == Engine::Sql {
+        decl.sql
+            .as_deref()
+            .and_then(|s| sql::column_lineage_from_sql(s).ok())
+    } else {
+        None
+    };
+    if let Some(l) = &sql_lineage {
+        if l.wildcard_in_projection {
+            doc.diagnostics.push(
+                Diagnostic::warn(
+                    "W_SQL_WILDCARD",
+                    format!(
+                        "task '{}': SQL uses SELECT * with an explicit INSERT column list; \
+                         column lineage cannot be derived safely — declare a column_map",
+                        decl.task_name
+                    ),
+                )
+                .at(loc.clone()),
+            );
+        }
+        if let Some((proj, tgt)) = l.arity_mismatch {
+            doc.diagnostics.push(
+                Diagnostic::warn(
+                    "W_SQL_ARITY",
+                    format!(
+                        "task '{}': SQL projection has {proj} column(s) but the INSERT lists {tgt}; \
+                         column lineage skipped — declare a column_map",
+                        decl.task_name
+                    ),
+                )
+                .at(loc.clone()),
+            );
+        }
+    }
+
+    // 4. Build column lineage once per output, then distribute each mapping to
+    //    the (input, output) edges its sources actually belong to (finding #4).
+    let default_input = inputs.first().cloned();
+    for output in &outputs {
+        let col_edges = match &default_input {
+            Some(di) => build_output_column_edges(decl, output, di, &inputs, sql_lineage.as_ref()),
+            None => Vec::new(),
+        };
+
+        let mut first_edge = true;
+        for input in &inputs {
+            if input == output {
+                continue;
+            }
+            let mut edge = Edge::new(input.clone(), output.clone());
+            edge.job = Some(job_id.clone());
+            edge.transform = Transform {
+                kind: decl.transform.clone(),
+                description: decl.description.clone(),
+                sql: decl.sql.clone(),
+            };
+            edge.origin = Origin::declared();
+
+            for ce in &col_edges {
+                let attach = if ce.from_columns.is_empty() {
+                    // A source-less mapping (e.g. COUNT(*)) can't be attributed
+                    // to a particular input; attach it to one edge only.
+                    first_edge
+                } else {
+                    ce.from_columns.iter().any(|fc| &fc.dataset == input)
+                };
+                if attach {
+                    edge.column_lineage.push(ce.clone());
+                }
+            }
+            doc.edges.push(edge);
+            first_edge = false;
+        }
+    }
+}
+
+/// Emit hygiene diagnostics for one declaration. `inputs`/`outputs` are the
+/// FQN-expanded dataset names. (Engine is inferred when omitted, so a missing
+/// engine is no longer an error — Tier 1.)
+fn emit_decl_diagnostics(
+    decl: &TaskDecl,
+    engine: Engine,
+    inputs: &[String],
+    outputs: &[String],
+    loc: &SourceLoc,
+    doc: &mut WeaveDocument,
+) {
+    // inputs and outputs are mandatory for a data-producing task.
+    if inputs.is_empty() || outputs.is_empty() {
+        doc.diagnostics.push(
+            Diagnostic::error(
+                "E_MISSING_IO",
+                format!(
+                    "task '{}' must declare both inputs= and outputs= (got {} input(s), {} output(s))",
+                    decl.task_name,
+                    inputs.len(),
+                    outputs.len()
+                ),
+            )
+            .at(loc.clone()),
+        );
+    }
+    // (#5) sql= on a non-SQL engine is silently ignored — warn.
+    if decl.sql.is_some() && engine != Engine::Sql {
+        doc.diagnostics.push(
+            Diagnostic::warn(
+                "W_SQL_NOT_PARSED",
+                format!(
+                    "task '{}' provides sql= but engine is {:?}; SQL column lineage is only \
+                     extracted for engine=\"sql\"",
+                    decl.task_name, engine
+                ),
+            )
+            .at(loc.clone()),
+        );
+    }
+    // (#6) keyword arguments that weren't literals/constants were dropped.
+    for kw in &decl.unresolved {
+        doc.diagnostics.push(
+            Diagnostic::warn(
+                "W_NON_LITERAL",
+                format!(
+                    "task '{}': argument '{kw}' is not a string literal or module-level constant \
+                     and was ignored (trace-weaver scans statically — use a literal or a top-level constant)",
+                    decl.task_name
+                ),
+            )
+            .at(loc.clone()),
+        );
+    }
+    // (#10) dataset FQNs that aren't 4-part are accepted but won't export to OM.
+    // After Tier 1 expansion this only fires when there's no configure() default
+    // and the engineer wrote a bare name.
+    for ds_name in inputs.iter().chain(outputs.iter()) {
+        if FqnParts::parse(ds_name).is_none() {
+            doc.diagnostics.push(
+                Diagnostic::warn(
+                    "W_BAD_FQN",
+                    format!(
+                        "dataset '{ds_name}' is not a 4-part FQN 'service.database.schema.table' \
+                         (add tw.configure(service=, database=, schema=) or write the full FQN); \
+                         the OpenMetadata exporter will skip it"
+                    ),
+                )
+                .at(loc.clone()),
+            );
+        }
+    }
+}
+
+/// Build a dataset from an FQN, parsing the OpenMetadata parts when possible.
+fn build_dataset(fqn: &str) -> Dataset {
+    let mut ds = Dataset::new(fqn).with_origin(Origin::declared());
+    if let Some(parts) = FqnParts::parse(fqn) {
+        ds.fqn = Some(parts);
+    }
+    ds
+}
+
+/// Build the column lineage for one output: declared `column_map` entries first,
+/// then SQL-inferred mappings for any target column not already declared. Bare
+/// source columns resolve against `default_input`; qualified `tbl.col` against
+/// the matching input. The SQL result is only applied when it targets this
+/// output's table.
+fn build_output_column_edges(
+    decl: &TaskDecl,
+    output: &str,
+    default_input: &str,
+    all_inputs: &[String],
+    sql_lineage: Option<&sql::SqlColumnLineage>,
+) -> Vec<ColumnEdge> {
+    let mut edges: Vec<ColumnEdge> = Vec::new();
+    let mut mapped: Vec<String> = Vec::new();
+
+    // ── Declared ──
+    for entry in &decl.column_map {
+        edges.push(declared_column_edge(
+            entry,
+            default_input,
+            output,
+            all_inputs,
+        ));
+        mapped.push(entry.target.clone());
+    }
+
+    // ── Inferred from SQL (only for this output's table) ──
+    if let Some(l) = sql_lineage {
+        let applies = match &l.target_table {
+            Some(t) => output.rsplit('.').next() == Some(t.as_str()) || output == t,
+            None => true,
+        };
+        if applies {
+            for m in &l.mappings {
+                if mapped.iter().any(|c| c == &m.target) {
+                    continue;
+                }
+                edges.push(sql_column_edge(m, default_input, output, all_inputs));
+                mapped.push(m.target.clone());
+            }
+        }
+    }
+
+    edges
+}
+
+/// Build a declared ColumnEdge from a `column_map` entry.
+fn declared_column_edge(
+    entry: &ColumnMapEntry,
+    input: &str,
+    output: &str,
+    all_inputs: &[String],
+) -> ColumnEdge {
+    let from_columns: Vec<ColumnRef> = entry
+        .sources
+        .iter()
+        .map(|s| resolve_source_ref(s, input, all_inputs))
+        .collect();
+    let mut ce = ColumnEdge::new(from_columns, ColumnRef::new(output, entry.target.clone()));
+    ce.function = entry.function.clone();
+    ce.transform_type = classify_function_label(entry.function.as_deref(), entry.sources.len());
+    ce.origin = Origin::declared();
+    ce
+}
+
+/// Build a ColumnEdge from a SQL-inferred mapping.
+fn sql_column_edge(m: &SqlMapping, input: &str, output: &str, all_inputs: &[String]) -> ColumnEdge {
+    let from_columns: Vec<ColumnRef> = m
+        .sources
+        .iter()
+        .map(|s| resolve_sql_source_ref(s, input, all_inputs))
+        .collect();
+    let mut ce = ColumnEdge::new(from_columns, ColumnRef::new(output, m.target.clone()));
+    ce.function = Some(m.function.clone());
+    ce.transform_type = m.transform_type;
+    ce.origin = Origin::inferred_sql(SQL_CONFIDENCE);
+    ce
+}
+
+/// Resolve a bare/qualified declared source column to a [`ColumnRef`].
+///
+/// `"col"` resolves to the edge's single `input` dataset; `"tbl.col"` resolves
+/// against whichever of `all_inputs` ends with `.tbl` (or whose final FQN
+/// segment is `tbl`), falling back to `input`.
+fn resolve_source_ref(src: &str, input: &str, all_inputs: &[String]) -> ColumnRef {
+    if let Some((tbl, col)) = src.rsplit_once('.') {
+        // Could be a qualified "tbl.col"; match against inputs.
+        if let Some(ds) = match_input_by_table(tbl, all_inputs) {
+            return ColumnRef::new(ds, col);
+        }
+        // Not a recognised table qualifier — treat the whole thing as a column
+        // on the edge input only if it has no dot; otherwise use the tail.
+        return ColumnRef::new(input, col);
+    }
+    ColumnRef::new(input, src)
+}
+
+/// Same resolution for SQL-derived refs, which carry an optional table.
+fn resolve_sql_source_ref(src: &SqlColRef, input: &str, all_inputs: &[String]) -> ColumnRef {
+    if let Some(tbl) = &src.table {
+        if let Some(ds) = match_input_by_table(tbl, all_inputs) {
+            return ColumnRef::new(ds, src.column.clone());
+        }
+    }
+    ColumnRef::new(input, src.column.clone())
+}
+
+/// Find an input dataset whose final FQN segment matches `tbl`.
+fn match_input_by_table(tbl: &str, all_inputs: &[String]) -> Option<String> {
+    all_inputs
+        .iter()
+        .find(|fqn| fqn.rsplit('.').next() == Some(tbl) || fqn.as_str() == tbl)
+        .cloned()
+}
+
+/// Classify a declared `function` label into a [`TransformType`].
+fn classify_function_label(label: Option<&str>, n_sources: usize) -> TransformType {
+    let label = match label {
+        Some(l) => l.trim(),
+        None => {
+            return if n_sources <= 1 {
+                TransformType::Identity
+            } else {
+                TransformType::Transformation
+            }
+        }
+    };
+    let upper = label.to_ascii_uppercase();
+    if ["COUNT", "SUM", "AVG", "MIN", "MAX", "GROUP BY"]
+        .iter()
+        .any(|kw| upper.contains(kw))
+    {
+        return TransformType::Aggregation;
+    }
+    let l = label.to_ascii_lowercase();
+    if l == "direct copy" || l.starts_with("rename") || l == "identity" {
+        return TransformType::Identity;
+    }
+    TransformType::Transformation
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trace_weaver_core::OriginSource;
+
+    fn opts() -> ScanOptions {
+        ScanOptions {
+            namespace: "ns".into(),
+            producer: "test".into(),
+            enable_sql_inference: true,
+            enable_code_inference: true,
+        }
+    }
+
+    #[test]
+    fn declared_column_map_yields_declared_origin() {
+        let src = r#"
+import trace_weaver as tw
+@tw.task(
+    dag="d",
+    inputs=["Test Database.poc_db.public.bronze_sales"],
+    outputs=["Test Database.poc_db.public.silver_sales"],
+    engine="pandas",
+    transform="ENRICH",
+    column_map=[
+        (["amount", "currency"], "amount_usd", "ROUND(amount * fx[currency], 2)"),
+        (["event_id"], "event_id", "direct copy"),
+    ],
+)
+def build_silver():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("test.py", src, &opts(), &mut doc).unwrap();
+
+        assert_eq!(doc.jobs.len(), 1);
+        assert_eq!(doc.jobs[0].engine, Engine::Pandas);
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert_eq!(edge.column_lineage.len(), 2);
+        for ce in &edge.column_lineage {
+            assert_eq!(ce.origin.source, OriginSource::Declared);
+        }
+        // Fan-in: amount_usd has two sources, both on the input dataset.
+        let usd = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "amount_usd")
+            .unwrap();
+        assert_eq!(usd.from_columns.len(), 2);
+        assert_eq!(
+            usd.from_columns[0].dataset,
+            "Test Database.poc_db.public.bronze_sales"
+        );
+        assert_eq!(usd.transform_type, TransformType::Transformation);
+
+        let ev = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "event_id")
+            .unwrap();
+        assert_eq!(ev.transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn sql_only_hop_yields_inferred_sql_edges() {
+        let src = r#"
+import trace_weaver as tw
+BRONZE_SQL = """
+INSERT INTO bronze_sales (event_id, customer_name, amount, currency, event_ts)
+SELECT raw_event_id::bigint, customer, amount::numeric(12,2), currency, event_ts::timestamp
+FROM (
+  SELECT *, row_number() OVER (PARTITION BY raw_event_id ORDER BY ingested_at) AS rn
+  FROM landing_sales
+) deduped
+WHERE rn = 1;
+"""
+@tw.task(
+    dag="medallion_lineage",
+    inputs=["Test Database.poc_db.public.landing_sales"],
+    outputs=["Test Database.poc_db.public.bronze_sales"],
+    engine="sql",
+    sql=BRONZE_SQL,
+    transform="CAST / PARSE / DEDUPE",
+)
+def build_bronze():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("test.py", src, &opts(), &mut doc).unwrap();
+
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        // 5 target columns, all inferred from SQL (no column_map declared).
+        assert_eq!(edge.column_lineage.len(), 5);
+        assert!(edge
+            .column_lineage
+            .iter()
+            .all(|c| c.origin.source == OriginSource::InferredSql));
+
+        // event_id <- raw_event_id, resolved to the input dataset.
+        let ev = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "event_id")
+            .unwrap();
+        assert_eq!(ev.from_columns[0].column, "raw_event_id");
+        assert_eq!(
+            ev.from_columns[0].dataset,
+            "Test Database.poc_db.public.landing_sales"
+        );
+        assert_eq!(
+            ev.to_column.dataset,
+            "Test Database.poc_db.public.bronze_sales"
+        );
+        // Inferred display function carries the tag.
+        assert!(ev
+            .display_function()
+            .unwrap()
+            .contains("(inferred from SQL)"));
+    }
+
+    #[test]
+    fn partial_map_mixes_declared_and_inferred() {
+        let src = r#"
+import trace_weaver as tw
+GOLD_SQL = """
+INSERT INTO gold_sales_daily (event_date, total_transactions, unique_customers, total_revenue_usd, avg_transaction_usd)
+SELECT event_date, COUNT(*), COUNT(DISTINCT customer_name), SUM(amount_usd), ROUND(AVG(amount_usd), 2)
+FROM silver_sales
+WHERE is_valid
+GROUP BY event_date;
+"""
+@tw.task(
+    dag="medallion_lineage",
+    inputs=["Test Database.poc_db.public.silver_sales"],
+    outputs=["Test Database.poc_db.public.gold_sales_daily"],
+    engine="sql",
+    sql=GOLD_SQL,
+    transform="AGGREGATE daily",
+    column_map=[
+        (["event_date"], "event_date", "GROUP BY key"),
+        (["amount_usd"], "total_revenue_usd", "SUM(amount_usd)"),
+    ],
+)
+def build_gold():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("test.py", src, &opts(), &mut doc).unwrap();
+
+        let edge = &doc.edges[0];
+        let by: std::collections::HashMap<_, _> = edge
+            .column_lineage
+            .iter()
+            .map(|c| (c.to_column.column.clone(), c))
+            .collect();
+
+        // Declared.
+        assert_eq!(by["event_date"].origin.source, OriginSource::Declared);
+        assert_eq!(
+            by["total_revenue_usd"].origin.source,
+            OriginSource::Declared
+        );
+        // Inferred from SQL (not declared).
+        assert_eq!(
+            by["total_transactions"].origin.source,
+            OriginSource::InferredSql
+        );
+        assert_eq!(
+            by["unique_customers"].origin.source,
+            OriginSource::InferredSql
+        );
+        assert_eq!(
+            by["avg_transaction_usd"].origin.source,
+            OriginSource::InferredSql
+        );
+        // All five present, none duplicated.
+        assert_eq!(edge.column_lineage.len(), 5);
+    }
+
+    #[test]
+    fn missing_io_is_an_error_but_missing_engine_is_inferred() {
+        // Tier 1: engine is inferred (no error); only missing inputs/outputs errors.
+        let src = r#"
+import trace_weaver as tw
+@tw.task(dag="d")
+def t():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"E_MISSING_IO"), "{codes:?}");
+        assert!(
+            !codes.contains(&"E_MISSING_ENGINE"),
+            "engine should be inferred, not errored: {codes:?}"
+        );
+        assert!(trace_weaver_core::has_errors(&doc.diagnostics));
+    }
+
+    #[test]
+    fn configure_expands_bare_names_and_sql_shortcut_infers_lineage() {
+        // Tier 1+2 end-to-end via scan_source: bare names + @tw.sql + configure().
+        let src = r#"
+import trace_weaver as tw
+tw.configure(service="Test Database", database="poc_db", schema="public")
+B_SQL = "INSERT INTO bronze_sales (event_id) SELECT raw_event_id::bigint FROM landing_sales"
+@tw.sql(B_SQL, inputs=["landing_sales"], outputs=["bronze_sales"])
+def build_bronze():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        // Bare names expanded to full FQNs.
+        assert!(doc
+            .dataset("Test Database.poc_db.public.bronze_sales")
+            .is_some());
+        assert!(doc
+            .dataset("Test Database.poc_db.public.landing_sales")
+            .is_some());
+        // No E_/W_BAD_FQN — everything resolved.
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(!codes.contains(&"W_BAD_FQN"), "{codes:?}");
+        // @tw.sql inferred a column edge from the SQL.
+        assert_eq!(doc.edges.len(), 1);
+        assert_eq!(doc.edges[0].column_lineage.len(), 1);
+        assert_eq!(doc.edges[0].column_lineage[0].to_column.column, "event_id");
+        assert_eq!(doc.jobs[0].engine, Engine::Sql);
+    }
+
+    #[test]
+    fn non_literal_sql_is_flagged_not_silently_dropped() {
+        // f-string sql= can't be resolved statically (finding #6).
+        let src = r#"
+import trace_weaver as tw
+TABLE = "x"
+@tw.task(
+    inputs=["s.d.p.a"],
+    outputs=["s.d.p.b"],
+    engine="sql",
+    sql=f"INSERT INTO {TABLE} SELECT 1",
+)
+def t():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains(&"W_NON_LITERAL"),
+            "expected W_NON_LITERAL, got {codes:?}"
+        );
+    }
+
+    #[test]
+    fn multi_input_does_not_cross_contaminate() {
+        // Two inputs, each contributing its own column; the column_map entry for
+        // a column from input A must NOT be attached to the B->C edge (finding #4).
+        let src = r#"
+import trace_weaver as tw
+@tw.task(
+    inputs=["s.d.p.a", "s.d.p.b"],
+    outputs=["s.d.p.c"],
+    engine="python",
+    column_map=[
+        (["a.x"], "cx", "copy from a"),
+        (["b.y"], "cy", "copy from b"),
+    ],
+)
+def t():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        // Two edges: a->c and b->c.
+        assert_eq!(doc.edges.len(), 2);
+        let ac = doc.edges.iter().find(|e| e.from == "s.d.p.a").unwrap();
+        let bc = doc.edges.iter().find(|e| e.from == "s.d.p.b").unwrap();
+        // a->c carries only the 'cx' mapping; b->c only 'cy'.
+        assert_eq!(ac.column_lineage.len(), 1);
+        assert_eq!(ac.column_lineage[0].to_column.column, "cx");
+        assert_eq!(bc.column_lineage.len(), 1);
+        assert_eq!(bc.column_lineage[0].to_column.column, "cy");
+    }
+
+    #[test]
+    fn short_fqn_is_warned_via_scan_path() {
+        // A non-4-part dataset name with no configure() to expand it is accepted
+        // but flagged W_BAD_FQN (it won't export to OpenMetadata). Positive lock
+        // for probe p9 — complements configure_expands_... which asserts ABSENCE.
+        let src = r#"
+import trace_weaver as tw
+@tw.task(inputs=["landing_sales"], outputs=["bronze.sales"], engine="sql",
+         sql="INSERT INTO bronze_sales (a) SELECT x FROM landing_sales")
+def f():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("t.py", src, &opts(), &mut doc).unwrap();
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            codes.contains(&"W_BAD_FQN"),
+            "expected W_BAD_FQN, got {codes:?}"
+        );
+    }
+
+    /// Write `src` to a fresh temp dir and run the full document pipeline
+    /// (`scan_path`), so document-level post-passes (W_NO_COLUMN_LINEAGE, schema
+    /// back-fill, code inference) run — they do NOT run under bare `scan_source`.
+    fn scan_one(dir_name: &str, src: &str) -> WeaveDocument {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(dir_name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("dag.py")).unwrap();
+        write!(f, "{src}").unwrap();
+        let doc = scan_path(&dir, &opts()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        doc
+    }
+
+    #[test]
+    fn bare_multi_input_column_map_binds_to_first_input_only() {
+        // With >1 input, BARE (unqualified) column_map sources bind to the FIRST
+        // input only; the other input edge gets no column lineage and is warned.
+        // Probe p3 — contrast multi_input_does_not_cross_contaminate (qualified).
+        let doc = scan_one(
+            "trace_weaver_scan_test_p3",
+            r#"
+import trace_weaver as tw
+@tw.task(
+    inputs=["s.d.p.bronze", "s.d.p.fx"],
+    outputs=["s.d.p.silver"],
+    engine="pandas",
+    column_map=[
+        (["amount", "rate"], "amount_usd", "amount * rate"),
+        (["event_id"], "event_id", "direct copy"),
+    ],
+)
+def t():
+    pass
+"#,
+        );
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"W_NO_COLUMN_LINEAGE"), "{codes:?}");
+        // Second input (fx) gets no column lineage; first input (bronze) carries it.
+        let fx = doc.edges.iter().find(|e| e.from == "s.d.p.fx").unwrap();
+        assert!(
+            fx.column_lineage.is_empty(),
+            "fx edge should carry no columns"
+        );
+        let bronze = doc.edges.iter().find(|e| e.from == "s.d.p.bronze").unwrap();
+        assert!(
+            !bronze.column_lineage.is_empty(),
+            "bronze edge should carry columns"
+        );
+    }
+
+    #[test]
+    fn copy_shortcut_declares_identity_via_scan_path() {
+        // copy=[...] produces DECLARED identity column lineage, so a pandas task of
+        // only same-name passthroughs is fully covered — and the document-level
+        // post-pass therefore does NOT raise W_NO_COLUMN_LINEAGE.
+        let doc = scan_one(
+            "trace_weaver_scan_test_copy",
+            r#"
+import trace_weaver as tw
+@tw.task(inputs=["s.d.p.a"], outputs=["s.d.p.b"], engine="pandas",
+         copy=["event_id", "amount"])
+def t():
+    pass
+"#,
+        );
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            !codes.contains(&"W_NO_COLUMN_LINEAGE"),
+            "copy should declare lineage so the no-column-lineage warning must not fire: {codes:?}"
+        );
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert_eq!(edge.column_lineage.len(), 2);
+        for ce in &edge.column_lineage {
+            // same-name identity, declared (not inferred-from-code).
+            assert_eq!(ce.function.as_deref(), Some("direct copy"));
+            assert_eq!(ce.from_columns.len(), 1);
+            assert_eq!(ce.from_columns[0].column, ce.to_column.column);
+            assert!(
+                !ce.origin.is_inferred(),
+                "copy edges must be DECLARED, got {:?}",
+                ce.origin
+            );
+        }
+    }
+
+    #[test]
+    fn no_column_lineage_edge_is_warned_via_scan_path() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("trace_weaver_scan_test_nocl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dag.py");
+        let mut f = std::fs::File::create(&file).unwrap();
+        write!(
+            f,
+            r#"
+import trace_weaver as tw
+@tw.task(inputs=["s.d.p.a"], outputs=["s.d.p.b"], engine="pandas")
+def t():
+    pass
+"#
+        )
+        .unwrap();
+        let doc = scan_path(&dir, &opts()).unwrap();
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(codes.contains(&"W_NO_COLUMN_LINEAGE"), "{codes:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn code_inference_tier_is_live_via_scan_path() {
+        // Regression for finding #3 (the inferred_code tier was structurally
+        // dead). Across tasks, schemas are back-filled from observed columns,
+        // then a same-named unmapped column is filled with an inferred_code
+        // identity edge. Here A.x and B.x both become "observed" (A.x as a
+        // target of z->A, B.x as a source of B->C), so the A->B edge — which
+        // only declared `k` — gets x filled by code inference.
+        use std::io::Write;
+        use trace_weaver_core::OriginSource;
+        let dir = std::env::temp_dir().join("trace_weaver_scan_test_codeinfer");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut f = std::fs::File::create(dir.join("dag.py")).unwrap();
+        write!(
+            f,
+            r#"
+import trace_weaver as tw
+@tw.task(inputs=["s.d.p.z"], outputs=["s.d.p.a"], engine="pandas", column_map=[(["x"], "x", "copy")])
+def t0(): ...
+@tw.task(inputs=["s.d.p.a"], outputs=["s.d.p.b"], engine="pandas", column_map=[(["k"], "k", "copy")])
+def t1(): ...
+@tw.task(inputs=["s.d.p.b"], outputs=["s.d.p.c"], engine="pandas", column_map=[(["x"], "y", "copy")])
+def t2(): ...
+"#
+        )
+        .unwrap();
+        let doc = scan_path(&dir, &opts()).unwrap();
+        let ab = doc
+            .edges
+            .iter()
+            .find(|e| e.from == "s.d.p.a" && e.to == "s.d.p.b")
+            .unwrap();
+        let inferred_x = ab
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "x" && c.origin.source == OriginSource::InferredCode);
+        assert!(
+            inferred_x.is_some(),
+            "expected an inferred_code identity edge for A.x -> B.x; got {:?}",
+            ab.column_lineage
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

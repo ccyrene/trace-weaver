@@ -1,0 +1,20 @@
+# Gitleaks configuration — secret scanning policy for trace-weaver.
+# Extends the built-in ruleset; add allowlist entries here (with a comment)
+# instead of disabling the scan when a finding is a confirmed false positive.
+
+title = "trace-weaver secret scanning policy"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known-safe placeholders and demo-only credentials (never put real secrets here)"
+regexes = [
+    # Demo JWT used only by the Docker e2e mock OpenMetadata server
+    # (docker/compose.e2e.yml, docker/run_e2e.sh, docs). Not a real token.
+    '''test-jwt-token''',
+]
+paths = [
+    # Pinned dependency lockfile — hashes, not secrets.
+    '''(^|/)Cargo\.lock$''',
+]

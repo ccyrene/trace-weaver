@@ -1,0 +1,41 @@
+# trace-weaver — column-level data-lineage compiler
+# Workspace root. See README.md for the architecture overview.
+[workspace]
+resolver = "2"
+members = [
+    "crates/trace-weaver-core",
+    "crates/trace-weaver-scan",
+    "crates/trace-weaver-export",
+    "crates/trace-weaver-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "Apache-2.0"
+authors = ["trace-weaver contributors"]
+repository = "https://github.com/ccyrene/trace-weaver"
+
+[workspace.dependencies]
+# shared third-party crates, pinned at the workspace level
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+anyhow = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+walkdir = "2"
+rustpython-parser = "0.4"
+sqlparser = "0.62"
+ureq = { version = "3", features = ["json"] }
+indexmap = { version = "2", features = ["serde"] }
+
+# internal crates
+trace-weaver-core = { path = "crates/trace-weaver-core" }
+trace-weaver-scan = { path = "crates/trace-weaver-scan" }
+trace-weaver-export = { path = "crates/trace-weaver-export" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

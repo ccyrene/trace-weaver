@@ -1,0 +1,46 @@
+# Release pipeline for the trace-weaver data-lineage compiler.
+# On a `v*` tag it builds the production image at the repo root. The registry push is
+# intentionally disabled by default (commented + secret-gated) so this workflow is safe to land.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build release image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image (tagged from git ref)
+        run: docker build -t "trace-weaver:${GITHUB_REF_NAME}" -t trace-weaver:latest .
+
+      # --- Registry push: DISABLED by default ----------------------------------
+      # To enable, uncomment the two steps below and configure the repository
+      # secrets REGISTRY, REGISTRY_USERNAME, and REGISTRY_PASSWORD. The job-level
+      # guard keeps the push from ever running until a registry secret exists.
+      #
+      # - name: Log in to registry
+      #   if: ${{ secrets.REGISTRY != '' }}
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ${{ secrets.REGISTRY }}
+      #     username: ${{ secrets.REGISTRY_USERNAME }}
+      #     password: ${{ secrets.REGISTRY_PASSWORD }}
+      #
+      # - name: Tag and push
+      #   if: ${{ secrets.REGISTRY != '' }}
+      #   run: |
+      #     docker tag "trace-weaver:${GITHUB_REF_NAME}" "${{ secrets.REGISTRY }}/trace-weaver:${GITHUB_REF_NAME}"
+      #     docker tag trace-weaver:latest "${{ secrets.REGISTRY }}/trace-weaver:latest"
+      #     docker push "${{ secrets.REGISTRY }}/trace-weaver:${GITHUB_REF_NAME}"
+      #     docker push "${{ secrets.REGISTRY }}/trace-weaver:latest"
+      # -------------------------------------------------------------------------

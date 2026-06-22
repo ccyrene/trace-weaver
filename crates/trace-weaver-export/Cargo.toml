@@ -1,0 +1,15 @@
+[package]
+name = "trace-weaver-export"
+description = "Export a weave document to OpenMetadata, OpenLineage, or a DOT graph."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+trace-weaver-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true

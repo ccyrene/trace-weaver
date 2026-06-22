@@ -1,0 +1,7 @@
+# Dockerfile lint policy (hadolint) for the trace-weaver production image.
+# DL3008: pin apt package versions — the slim runtime installs only
+#         ca-certificates from the regularly-rebuilt debian:bookworm-slim base;
+#         pinning that one package adds churn for no real security gain.
+ignored:
+  - DL3008
+failure-threshold: warning

@@ -1,0 +1,15 @@
+# Ruff config for the `trace_weaver` Python authoring SDK + example DAGs.
+#
+# CI runs lint only (`ruff check`) — NOT `ruff format --check` — so the
+# hand-tuned showcase DAG (examples/dags/medallion.py) and the SDK keep
+# their deliberate, readable layout. Run `ruff format` locally if you want it.
+line-length = 100
+target-version = "py39"
+
+[lint]
+# E/F = pycodestyle errors + pyflakes; I = import sorting. Deliberately NOT enabling
+# UP (pyupgrade): the SDK keeps explicit typing.Optional/List/Union for py3.9 clarity.
+select = ["E", "F", "I"]
+ignore = [
+    "E501", # long SQL / markdown / docstring lines in the SDK and examples are intentional
+]
