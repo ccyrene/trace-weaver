@@ -205,6 +205,60 @@ and `TRACEWEAVER_MIN_HIGH_CONFIDENCE` — and an explicit flag always wins over 
 env var. **Exit codes:** `0` pass, `1` a threshold failed (the failing metric is
 printed), `2` usage error (bad path, unparseable threshold, invalid `--format`).
 
+#### Running `gate` in CI
+
+Once a release is published (see [Publishing](#publishing-docker-hub) below),
+pull the image instead of building from source. `gate` never writes a file, so
+a plain bind mount at the image's `WORKDIR` (`/work`) is enough — no volume
+permission juggling needed (contrast `scan -o`, which writes into the mount
+and does need it — see [Running via Docker](#running-via-docker)):
+
+```bash
+docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+  gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+**GitHub Actions:**
+
+```yaml
+name: lineage-gate
+on: [pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trace-weaver lineage gate
+        run: |
+          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+            gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+**Bitbucket Pipelines** (needs the `docker` service to run `docker run` inside
+a step):
+
+```yaml
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: trace-weaver lineage gate
+          services:
+            - docker
+          script:
+            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.2.0
+                gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+Swap `<dockerhub-namespace>` for the `DOCKERHUB_USERNAME` the image was
+published under, and pin to a release tag (`:0.2.0`) rather than `:latest` for
+a reproducible gate.
+
 ---
 
 ## Lineage decorator (`@lineage`)
@@ -260,6 +314,19 @@ returns your function unchanged, so your DAGs run exactly as before.
 ```bash
 cd python && pip install -e .        # stdlib only, Python 3.9+
 ```
+
+### Installing in an Airflow image
+
+DAG code runs inside your Airflow image, not this repo, so install the SDK
+straight from GitHub — no local checkout needed:
+
+```bash
+pip install "trace-weaver @ git+https://github.com/ccyrene/trace-weaver@main#subdirectory=python"
+```
+
+This tracks the `main` branch. Once a versioned tag is released, pin to it
+instead (e.g. `@v0.2.0#subdirectory=python`) — a tag will be preferred over
+`@main` as soon as one exists, for reproducible image builds.
 
 ```python
 import trace_weaver as tw
@@ -328,6 +395,33 @@ ruff check python examples                                       # Python SDK + 
 
 Rust 2021 edition, MSRV 1.80.
 
+## Running via Docker
+
+The `Dockerfile` is a two-stage build: a `builder` stage compiles a stripped
+release binary, and a `debian:bookworm-slim` `runtime` stage carries just the
+binary + CA roots, running as a fixed non-root `traceweaver` user (uid/gid
+`10001`). `WORKDIR` is `/work` and `ENTRYPOINT` is `["trace-weaver"]`, so any
+CLI subcommand is just appended as `docker run` arguments:
+
+```bash
+docker build -t trace-weaver:0.2.0 .
+
+# Read-only commands (gate, validate, export --dry-run): bind-mount the repo
+# at /work — no special permissions needed since nothing is written back.
+docker run --rm -v "$PWD:/work" trace-weaver:0.2.0 \
+  gate --repo-path examples/sample_dags --min-task-coverage 0.5
+
+# Commands that write into the mount (scan -o, export -o, graph -o): pass
+# --user "$(id -u):$(id -g)" so the container writes as YOUR uid, not the
+# image's fixed uid 10001 (which the bind-mounted host directory doesn't
+# grant write access to).
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.2.0 \
+  scan examples/sample_dags -o /work/out.weave.json
+```
+
+Once an image is published (below), swap the locally-built `trace-weaver:0.2.0`
+tag for `<dockerhub-namespace>/trace-weaver:0.2.0`.
+
 ## Publishing (Docker Hub)
 
 `.github/workflows/publish.yml` builds the production image and pushes it to
@@ -341,6 +435,17 @@ requires two **repository secrets**:
 | `DOCKERHUB_TOKEN`    | Docker Hub access token (used by `docker/login-action`) |
 
 The existing `ci.yml` gates are unchanged; publishing is a separate workflow.
+
+**Make the Docker Hub repository public.** The workflow only pushes; it never
+flips repo visibility. A private repo means every `docker pull` — including
+the [CI gate examples](#running-gate-in-ci) above and anyone else's `docker
+run` — needs Docker Hub credentials. Set the repository (create it once,
+manually, under the `DOCKERHUB_USERNAME` namespace, or via Docker Hub's own
+settings after the first push) to **public** so it can be pulled anonymously.
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
