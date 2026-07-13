@@ -452,7 +452,13 @@ fn scan_decl(
 
         let mut first_edge = true;
         for input in &inputs {
-            if input == output {
+            // A self-loop (input == output) is normally noise, so it is skipped —
+            // but a DECLARED self-loop is a legitimate hand-authored fact (e.g. a
+            // `@lineage(inputs=["s3://x"], outputs=["s3://x"])` "read prefix X and
+            // delete orphans in X"), so we emit it. The edge origin computed below
+            // is inferred only when an endpoint was non-literal; skip the self-loop
+            // in exactly that inferred case, mirroring the derive-edges guard.
+            if input == output && (nonliteral.contains(input) || element_origin.is_inferred()) {
                 continue;
             }
             let mut edge = Edge::new(input.clone(), output.clone());
@@ -1435,6 +1441,63 @@ def f():
             "dataset-level @lineage must not raise W_NO_COLUMN_LINEAGE: {codes:?}"
         );
         assert_eq!(doc.edges.len(), 1);
+    }
+
+    #[test]
+    fn declared_lineage_self_loop_emits_a_self_edge() {
+        // A declared @lineage whose input == output ("read prefix X and delete
+        // orphans in X") is a legitimate self-loop: it must yield exactly one
+        // declared self-edge X -> X, both via scan_source (scan_decl builds it)
+        // and after the full scan_path pipeline (derive_edges must not dup it).
+        let src = r#"
+from traceweaver import lineage
+@lineage(inputs=["s3://bucket/prefix"], outputs=["s3://bucket/prefix"],
+         description="delete orphaned objects in place")
+def dedupe_prefix():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag.py", src, &opts(), &mut doc).unwrap();
+        assert_eq!(doc.edges.len(), 1, "self-edge built during scan_decl");
+        let e = &doc.edges[0];
+        assert_eq!(e.from, "s3://bucket/prefix");
+        assert_eq!(e.to, "s3://bucket/prefix");
+        assert!(!e.origin.is_inferred(), "declared self-edge is declared");
+
+        // Full pipeline (scan_path runs derive_edges_from_jobs): still exactly one.
+        let doc2 = scan_one("trace_weaver_scan_test_selfloop", src);
+        assert_eq!(
+            doc2.edges.len(),
+            1,
+            "derive_edges must not duplicate the declared self-edge"
+        );
+        assert_eq!(doc2.edges[0].from, doc2.edges[0].to);
+    }
+
+    #[test]
+    fn nonliteral_lineage_self_loop_is_skipped_as_inferred() {
+        // A @lineage self-loop where the (identical) endpoint is a NON-literal
+        // (f-string) is medium/inferred, so — like any inferred self-loop — it is
+        // skipped rather than emitted, avoiding noise.
+        let src = r#"
+from traceweaver import lineage
+DAY = "2024-01-01"
+@lineage(inputs=[f"s3://bucket/{DAY}"], outputs=[f"s3://bucket/{DAY}"])
+def f():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag.py", src, &opts(), &mut doc).unwrap();
+        assert!(
+            doc.edges.is_empty(),
+            "inferred (non-literal) self-loop must be skipped: {:?}",
+            doc.edges
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone()))
+                .collect::<Vec<_>>()
+        );
+        // The job still exists (it is annotated), just with no self-edge.
+        assert_eq!(doc.jobs.len(), 1);
     }
 
     #[test]

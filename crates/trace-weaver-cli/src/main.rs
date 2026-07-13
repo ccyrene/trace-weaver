@@ -160,6 +160,11 @@ struct GateArgs {
     /// Falls back to $TRACEWEAVER_MIN_HIGH_CONFIDENCE, then 0.0. Flag wins.
     #[arg(long)]
     min_high_confidence: Option<f64>,
+    /// Minimum acceptable fraction of tasks that carry an explicit trace-weaver
+    /// decorator (annotation_coverage). Falls back to
+    /// $TRACEWEAVER_MIN_ANNOTATION_COVERAGE, then 0.0. Flag wins.
+    #[arg(long)]
+    min_annotation_coverage: Option<f64>,
     /// Report format.
     #[arg(long, value_enum, default_value_t = GateFormat::Text)]
     format: GateFormat,
@@ -311,6 +316,8 @@ struct DagMetrics {
     tasks_total: usize,
     tasks_with_lineage: usize,
     task_coverage: f64,
+    tasks_annotated: usize,
+    annotation_coverage: f64,
     edges_total: usize,
     high_confidence_edges: usize,
     high_confidence_fraction: f64,
@@ -322,6 +329,8 @@ struct GateMetrics {
     tasks_total: usize,
     tasks_with_lineage: usize,
     task_coverage: f64,
+    tasks_annotated: usize,
+    annotation_coverage: f64,
     edges_total: usize,
     high_confidence_edges: usize,
     high_confidence_fraction: f64,
@@ -339,12 +348,29 @@ fn frac(n: usize, d: usize, empty: f64) -> f64 {
 
 /// Compute lineage gate metrics from a scanned document.
 ///
-/// * A task "has lineage" when at least one edge is attributed to its job.
+/// * A task "has lineage" when at least one edge is attributed to its job
+///   (`task_coverage` = data-flow completeness). A declared self-loop counts,
+///   since it is now a real edge.
+/// * A task is "annotated" when it was synthesized from an explicit trace-weaver
+///   decorator (`@tw.task` / `@tw.sql` / `@lineage`, bare or called) — i.e. its
+///   job carries a **declared** (not inferred) origin. `annotation_coverage`
+///   = tasks_annotated / tasks_total measures **review** completeness (did a
+///   human mark this task at all), independent of whether the annotation yielded
+///   a full input→output edge.
+///
+///   `tasks_total` is the denominator for BOTH coverage metrics and counts
+///   **every** job, including Pass-B tasks discovered decorator-free from raw
+///   Airflow operators. Those raw-operator tasks *cannot* carry a decorator, so
+///   they can never be "annotated" and intentionally hold `annotation_coverage`
+///   below 1.0 — surfacing exactly the un-reviewed surface a human still owes an
+///   annotation. (A bare `@lineage` marker, by contrast, IS annotated even
+///   though it declares no datasets and so contributes no edge.)
 /// * "high confidence" == a **declared** (not inferred) edge — literal `@lineage`
 ///   / `@tw` declarations are declared; SQL/code-inferred and non-literal
 ///   `@lineage` datasets are not.
-/// * `task_coverage` is 0.0 for a document with no tasks; `high_confidence_fraction`
-///   is 1.0 for a document with no edges (nothing low-confidence to count).
+/// * `task_coverage`/`annotation_coverage` are 0.0 for a document with no tasks;
+///   `high_confidence_fraction` is 1.0 for a document with no edges (nothing
+///   low-confidence to count).
 fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -353,13 +379,18 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
     let job_by_id: HashMap<&str, &Job> = doc.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
     let dag_of = |j: &Job| j.dag.clone().unwrap_or_else(|| "default".to_string());
 
-    // (tasks_total, tasks_with_lineage, edges_total, high_confidence_edges)
-    let mut by_dag: BTreeMap<String, [usize; 4]> = BTreeMap::new();
+    // (tasks_total, tasks_with_lineage, tasks_annotated, edges_total, high_confidence_edges)
+    let mut by_dag: BTreeMap<String, [usize; 5]> = BTreeMap::new();
     for j in &doc.jobs {
         let e = by_dag.entry(dag_of(j)).or_default();
         e[0] += 1;
         if jobs_with_edges.contains(j.id.as_str()) {
             e[1] += 1;
+        }
+        // A declared job origin means the task was authored via an explicit
+        // decorator; an inferred origin means it was discovered decorator-free.
+        if !j.origin.is_inferred() {
+            e[2] += 1;
         }
     }
     for edge in &doc.edges {
@@ -370,9 +401,9 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
             .map(|j| dag_of(j))
             .unwrap_or_else(|| "default".to_string());
         let e = by_dag.entry(dag).or_default();
-        e[2] += 1;
+        e[3] += 1;
         if !edge.origin.is_inferred() {
-            e[3] += 1;
+            e[4] += 1;
         }
     }
 
@@ -383,9 +414,11 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
             tasks_total: c[0],
             tasks_with_lineage: c[1],
             task_coverage: frac(c[1], c[0], 0.0),
-            edges_total: c[2],
-            high_confidence_edges: c[3],
-            high_confidence_fraction: frac(c[3], c[2], 1.0),
+            tasks_annotated: c[2],
+            annotation_coverage: frac(c[2], c[0], 0.0),
+            edges_total: c[3],
+            high_confidence_edges: c[4],
+            high_confidence_fraction: frac(c[4], c[3], 1.0),
         })
         .collect();
 
@@ -395,6 +428,7 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
         .iter()
         .filter(|j| jobs_with_edges.contains(j.id.as_str()))
         .count();
+    let tasks_annotated = doc.jobs.iter().filter(|j| !j.origin.is_inferred()).count();
     let edges_total = doc.edges.len();
     let high_confidence_edges = doc.edges.iter().filter(|e| !e.origin.is_inferred()).count();
 
@@ -402,6 +436,8 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
         tasks_total,
         tasks_with_lineage,
         task_coverage: frac(tasks_with_lineage, tasks_total, 0.0),
+        tasks_annotated,
+        annotation_coverage: frac(tasks_annotated, tasks_total, 0.0),
         edges_total,
         high_confidence_edges,
         high_confidence_fraction: frac(high_confidence_edges, edges_total, 1.0),
@@ -491,6 +527,16 @@ fn cmd_gate(a: GateArgs) -> i32 {
             return 2;
         }
     };
+    let min_ann = match resolve_threshold(
+        a.min_annotation_coverage,
+        "TRACEWEAVER_MIN_ANNOTATION_COVERAGE",
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
 
     // Resolve the scan root: the working tree, or a temp checkout of --git-ref.
     let git_tmp: Option<PathBuf>;
@@ -531,11 +577,23 @@ fn cmd_gate(a: GateArgs) -> i32 {
     let m = compute_gate_metrics(&doc);
     let cov_pass = m.task_coverage >= min_cov;
     let hc_pass = m.high_confidence_fraction >= min_hc;
-    let passed = cov_pass && hc_pass;
+    let ann_pass = m.annotation_coverage >= min_ann;
+    let passed = cov_pass && hc_pass && ann_pass;
 
+    let t = GateThresholds {
+        min_cov,
+        min_hc,
+        min_ann,
+    };
+    let c = GateChecks {
+        cov_pass,
+        hc_pass,
+        ann_pass,
+        passed,
+    };
     match a.format {
-        GateFormat::Json => print_gate_json(&m, min_cov, min_hc, cov_pass, hc_pass, passed),
-        GateFormat::Text => print_gate_text(&m, min_cov, min_hc, cov_pass, hc_pass, passed),
+        GateFormat::Json => print_gate_json(&m, &t, &c),
+        GateFormat::Text => print_gate_text(&m, &t, &c),
     }
 
     if passed {
@@ -554,19 +612,30 @@ fn cleanup_git_tmp(git_tmp: &Option<PathBuf>) {
     }
 }
 
-fn print_gate_text(
-    m: &GateMetrics,
+/// Resolved gate thresholds (`--min-*` flag / env / default), grouped so the
+/// print helpers take one argument instead of a long positional list.
+struct GateThresholds {
     min_cov: f64,
     min_hc: f64,
+    min_ann: f64,
+}
+
+/// Per-metric PASS/FAIL outcomes plus the overall verdict.
+struct GateChecks {
     cov_pass: bool,
     hc_pass: bool,
+    ann_pass: bool,
     passed: bool,
-) {
+}
+
+fn print_gate_text(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
     let mark = |ok: bool| if ok { "PASS" } else { "FAIL" };
     println!("trace-weaver lineage gate");
     println!("  tasks_total               {}", m.tasks_total);
     println!("  tasks_with_lineage        {}", m.tasks_with_lineage);
     println!("  task_coverage             {:.3}", m.task_coverage);
+    println!("  tasks_annotated           {}", m.tasks_annotated);
+    println!("  annotation_coverage       {:.3}", m.annotation_coverage);
     println!("  edges_total               {}", m.edges_total);
     println!("  high_confidence_edges     {}", m.high_confidence_edges);
     println!(
@@ -577,10 +646,13 @@ fn print_gate_text(
         println!("  per-DAG:");
         for d in &m.per_dag {
             println!(
-                "    {:<24} coverage {:.3} ({}/{})  high-conf {:.3} ({}/{})",
+                "    {:<24} coverage {:.3} ({}/{})  annotated {:.3} ({}/{})  high-conf {:.3} ({}/{})",
                 d.dag,
                 d.task_coverage,
                 d.tasks_with_lineage,
+                d.tasks_total,
+                d.annotation_coverage,
+                d.tasks_annotated,
                 d.tasks_total,
                 d.high_confidence_fraction,
                 d.high_confidence_edges,
@@ -591,42 +663,47 @@ fn print_gate_text(
     println!();
     println!(
         "  [{}] task_coverage {:.3} >= {:.3} (min)",
-        mark(cov_pass),
+        mark(c.cov_pass),
         m.task_coverage,
-        min_cov
+        t.min_cov
+    );
+    println!(
+        "  [{}] annotation_coverage {:.3} >= {:.3} (min)",
+        mark(c.ann_pass),
+        m.annotation_coverage,
+        t.min_ann
     );
     println!(
         "  [{}] high_confidence_fraction {:.3} >= {:.3} (min)",
-        mark(hc_pass),
+        mark(c.hc_pass),
         m.high_confidence_fraction,
-        min_hc
+        t.min_hc
     );
     println!();
-    println!("gate: {}", if passed { "PASS" } else { "FAIL" });
-    if !passed {
-        if !cov_pass {
+    println!("gate: {}", if c.passed { "PASS" } else { "FAIL" });
+    if !c.passed {
+        if !c.cov_pass {
             eprintln!(
                 "gate failed: task_coverage {:.3} < min {:.3}",
-                m.task_coverage, min_cov
+                m.task_coverage, t.min_cov
             );
         }
-        if !hc_pass {
+        if !c.ann_pass {
+            eprintln!(
+                "gate failed: annotation_coverage {:.3} < min {:.3}",
+                m.annotation_coverage, t.min_ann
+            );
+        }
+        if !c.hc_pass {
             eprintln!(
                 "gate failed: high_confidence_fraction {:.3} < min {:.3}",
-                m.high_confidence_fraction, min_hc
+                m.high_confidence_fraction, t.min_hc
             );
         }
     }
 }
 
-fn print_gate_json(
-    m: &GateMetrics,
-    min_cov: f64,
-    min_hc: f64,
-    cov_pass: bool,
-    hc_pass: bool,
-    passed: bool,
-) {
+fn print_gate_json(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
     let per_dag: Vec<serde_json::Value> = m
         .per_dag
         .iter()
@@ -636,6 +713,8 @@ fn print_gate_json(
                 "tasks_total": d.tasks_total,
                 "tasks_with_lineage": d.tasks_with_lineage,
                 "task_coverage": d.task_coverage,
+                "tasks_annotated": d.tasks_annotated,
+                "annotation_coverage": d.annotation_coverage,
                 "edges_total": d.edges_total,
                 "high_confidence_edges": d.high_confidence_edges,
                 "high_confidence_fraction": d.high_confidence_fraction,
@@ -646,18 +725,22 @@ fn print_gate_json(
         "tasks_total": m.tasks_total,
         "tasks_with_lineage": m.tasks_with_lineage,
         "task_coverage": m.task_coverage,
+        "tasks_annotated": m.tasks_annotated,
+        "annotation_coverage": m.annotation_coverage,
         "edges_total": m.edges_total,
         "high_confidence_edges": m.high_confidence_edges,
         "high_confidence_fraction": m.high_confidence_fraction,
         "thresholds": {
-            "min_task_coverage": min_cov,
-            "min_high_confidence": min_hc,
+            "min_task_coverage": t.min_cov,
+            "min_high_confidence": t.min_hc,
+            "min_annotation_coverage": t.min_ann,
         },
         "checks": {
-            "task_coverage": cov_pass,
-            "high_confidence_fraction": hc_pass,
+            "task_coverage": c.cov_pass,
+            "high_confidence_fraction": c.hc_pass,
+            "annotation_coverage": c.ann_pass,
         },
-        "passed": passed,
+        "passed": c.passed,
         "per_dag": per_dag,
     });
     println!(
@@ -791,8 +874,61 @@ mod tests {
         let m = compute_gate_metrics(&doc);
         assert_eq!(m.tasks_total, 0);
         assert_eq!(m.task_coverage, 0.0);
+        assert_eq!(m.tasks_annotated, 0);
+        assert_eq!(m.annotation_coverage, 0.0);
         assert_eq!(m.edges_total, 0);
         assert_eq!(m.high_confidence_fraction, 1.0);
+    }
+
+    #[test]
+    fn annotation_coverage_counts_decorated_tasks_only() {
+        // Mix of task provenances in one DAG:
+        //  * t_full   — declared @lineage with both inputs & outputs (edge).
+        //  * t_inonly — declared @lineage, inputs only (no edge, but annotated).
+        //  * t_bare   — declared bare @lineage marker (no datasets, no edge).
+        //  * t_raw    — Pass-B raw operator discovered decorator-free (inferred
+        //               job origin) — cannot carry a decorator, so NOT annotated.
+        // annotation_coverage = 3/4; task_coverage counts only the edge-bearing
+        // tasks (t_full and t_raw) = 2/4.
+        let mut doc = WeaveDocument::new("ns", "test");
+        for d in ["a", "b", "raw_in", "raw_out"] {
+            doc.datasets.push(Dataset::new(d));
+        }
+
+        let mut t_full = job("dag", "t_full", &["a"], &["b"]);
+        t_full.origin = Origin::declared();
+        doc.jobs.push(t_full);
+
+        let mut t_inonly = job("dag", "t_inonly", &["a"], &[]);
+        t_inonly.origin = Origin::declared();
+        doc.jobs.push(t_inonly);
+
+        let mut t_bare = job("dag", "t_bare", &[], &[]);
+        t_bare.origin = Origin::declared();
+        doc.jobs.push(t_bare);
+
+        let mut t_raw = job("dag", "t_raw", &["raw_in"], &["raw_out"]);
+        t_raw.origin = Origin::inferred_code(0.7); // discovered decorator-free
+        doc.jobs.push(t_raw);
+
+        doc.edges.push(edge("a", "b", "dag.t_full", false));
+        doc.edges.push(edge("raw_in", "raw_out", "dag.t_raw", true));
+
+        let m = compute_gate_metrics(&doc);
+        assert_eq!(m.tasks_total, 4);
+        assert_eq!(
+            m.tasks_annotated, 3,
+            "the raw-operator task is not annotated"
+        );
+        assert!((m.annotation_coverage - 3.0 / 4.0).abs() < 1e-9);
+        // task_coverage is edge-based and unchanged in semantics: t_full + t_raw.
+        assert_eq!(m.tasks_with_lineage, 2);
+        assert!((m.task_coverage - 2.0 / 4.0).abs() < 1e-9);
+
+        // Per-DAG carries the same annotation numbers.
+        let d = &m.per_dag[0];
+        assert_eq!((d.tasks_annotated, d.tasks_total), (3, 4));
+        assert!((d.annotation_coverage - 3.0 / 4.0).abs() < 1e-9);
     }
 
     #[test]
