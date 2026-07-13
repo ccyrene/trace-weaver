@@ -59,6 +59,17 @@ pub struct TaskDecl {
     /// machine inference, so `scan_decl` stamps those structural elements with an
     /// inferred `Origin` instead of declared.
     pub discovered: bool,
+    /// True when this declaration came from the `@lineage(...)` authoring
+    /// decorator — declarative *dataset-level* lineage — rather than
+    /// `@tw.task`/`@tw.sql` or decorator-free discovery. Such tasks declare
+    /// input/output datasets only (no column_map / SQL), so they are exempt
+    /// from the "must declare inputs= and outputs=" and OM-FQN hygiene checks.
+    pub lineage: bool,
+    /// Dataset entries (from a `@lineage` `inputs=`/`outputs=`) that were NOT
+    /// string literals/constants. They are kept as a best-effort source-text
+    /// representation, and recorded here so the scanner stamps them
+    /// medium-confidence (inferred) provenance instead of declared/high.
+    pub nonliteral: std::collections::HashSet<String>,
 }
 
 /// Per-file defaults from a module-level `tw.configure(...)` call and/or a
@@ -120,14 +131,34 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
         }
     }
 
-    // Pass A: explicit `@tw.task` / `@tw.sql` declarations (also the override form).
+    // Local names bound to the `@lineage` authoring decorator (all import forms).
+    let lineage_names = collect_lineage_names(&suite);
+
+    // Pass A: explicit `@lineage` / `@tw.task` / `@tw.sql` declarations.
     let mut tasks = Vec::new();
     let mut decorated: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for stmt in &suite {
+    'func: for stmt in &suite {
         let func = match stmt {
             Stmt::FunctionDef(f) => f,
             _ => continue,
         };
+
+        // Prefer `@lineage`: a declarative dataset-level marker. When present it
+        // owns the declaration (a co-located Airflow `@task` carries no lineage),
+        // so build from it and skip the `@tw.task`/`@tw.sql` path for this func.
+        for deco in &func.decorator_list {
+            if let Some(call) = lineage_decorator(deco, &lineage_names) {
+                decorated.insert(func.name.to_string());
+                tasks.push(build_lineage_decl(
+                    func.name.as_str(),
+                    call,
+                    source,
+                    &consts,
+                ));
+                continue 'func;
+            }
+        }
+
         for deco in &func.decorator_list {
             if let Some((call, kind)) = task_decorator_call(deco) {
                 decorated.insert(func.name.to_string());
@@ -380,6 +411,167 @@ fn task_decorator_call(deco: &Expr) -> Option<(&ast::ExprCall, DecoratorKind)> {
         "sql" => Some((call, DecoratorKind::Sql)),
         _ => None,
     }
+}
+
+/// Local names that refer to the trace-weaver `@lineage` decorator.
+///
+/// The bare name `"lineage"` is always included (mirroring how `task`/`sql` are
+/// recognised by their final segment), plus any alias bound by
+/// `from ... import lineage as X`. Combined with attribute-form matching in
+/// [`lineage_decorator`], this resolves all documented import forms:
+/// `from traceweaver import lineage`, `... import lineage as X`,
+/// `import traceweaver` + `@traceweaver.lineage`, and
+/// `import traceweaver as tw` + `@tw.lineage` (the real package is
+/// `trace_weaver`, but matching is by symbol/final segment, so either spelling
+/// works).
+fn collect_lineage_names(suite: &[Stmt]) -> std::collections::HashSet<String> {
+    let mut names = std::collections::HashSet::new();
+    names.insert("lineage".to_string());
+    for stmt in suite {
+        if let Stmt::ImportFrom(imp) = stmt {
+            for alias in &imp.names {
+                if alias.name.as_str() == "lineage" {
+                    let bound = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "lineage".to_string());
+                    names.insert(bound);
+                }
+            }
+        }
+    }
+    names
+}
+
+/// If `deco` is a recognised `@lineage` decorator, return `Some(call)` where the
+/// inner is `Some(..)` for the `@lineage(...)` call form and `None` for the bare
+/// `@lineage` / `@tw.lineage` form. Matches a bare/aliased name against
+/// `names`, and any `*.lineage` attribute by its final segment.
+fn lineage_decorator<'a>(
+    deco: &'a Expr,
+    names: &std::collections::HashSet<String>,
+) -> Option<Option<&'a ast::ExprCall>> {
+    match deco {
+        // Bare name: @lineage or an aliased @X.
+        Expr::Name(n) if names.contains(n.id.as_str()) => Some(None),
+        // Bare attribute: @tw.lineage / @traceweaver.lineage.
+        Expr::Attribute(a) if a.attr.as_str() == "lineage" => Some(None),
+        // Call form: @lineage(...) / @tw.lineage(...) / @X(...).
+        Expr::Call(c) => {
+            let is_lineage = match c.func.as_ref() {
+                Expr::Name(n) => names.contains(n.id.as_str()),
+                Expr::Attribute(a) => a.attr.as_str() == "lineage",
+                _ => false,
+            };
+            is_lineage.then_some(Some(c))
+        }
+        _ => None,
+    }
+}
+
+/// Build a [`TaskDecl`] from an `@lineage(...)` decorator (or bare `@lineage`).
+///
+/// String-literal dataset entries are kept as-is (declared → high confidence);
+/// non-literal entries (f-strings, names, calls) are kept as a best-effort
+/// source-text representation and recorded in `nonliteral` so the scan stamps
+/// them medium confidence. `name=` overrides the task name; `description=` is
+/// carried through.
+fn build_lineage_decl(
+    name: &str,
+    call: Option<&ast::ExprCall>,
+    source: &str,
+    consts: &HashMap<String, String>,
+) -> TaskDecl {
+    let mut decl = TaskDecl {
+        task_name: name.to_string(),
+        lineage: true,
+        ..Default::default()
+    };
+    let call = match call {
+        Some(c) => c,
+        // Bare @lineage: the function is marked, with no declared datasets.
+        None => return decl,
+    };
+    decl.line = Some(byte_to_line(source, call.range().start().to_usize()));
+
+    for kw in &call.keywords {
+        let key = match &kw.arg {
+            Some(id) => id.to_string(),
+            None => continue, // **kwargs splat
+        };
+        match key.as_str() {
+            "inputs" => {
+                let (vals, nl) = resolve_uri_list(&kw.value, consts, source);
+                decl.inputs = vals;
+                decl.nonliteral.extend(nl);
+            }
+            "outputs" => {
+                let (vals, nl) = resolve_uri_list(&kw.value, consts, source);
+                decl.outputs = vals;
+                decl.nonliteral.extend(nl);
+            }
+            "name" => {
+                if let Some(s) = resolve_str(&kw.value, consts) {
+                    if !s.is_empty() {
+                        decl.task_name = s;
+                    }
+                }
+            }
+            "description" => match resolve_str(&kw.value, consts) {
+                Some(s) => decl.description = Some(s),
+                None if is_explicit_none(&kw.value) => {}
+                None => decl.description = Some(expr_source_text(&kw.value, source)),
+            },
+            _ => {}
+        }
+    }
+    decl
+}
+
+/// Resolve a `@lineage` `inputs=`/`outputs=` list into `(values, nonliteral)`.
+///
+/// Unlike [`resolve_str_list`], non-literal elements are NOT dropped: each is
+/// kept as its best-effort source text and also returned in the second vec. A
+/// non-list value (e.g. a bare variable) is treated as one non-literal entry.
+fn resolve_uri_list(
+    expr: &Expr,
+    consts: &HashMap<String, String>,
+    source: &str,
+) -> (Vec<String>, Vec<String>) {
+    let elts = match expr {
+        Expr::List(l) => &l.elts,
+        Expr::Tuple(t) => &t.elts,
+        _ => {
+            let text = expr_source_text(expr, source);
+            return (vec![text.clone()], vec![text]);
+        }
+    };
+    let mut vals = Vec::new();
+    let mut nonlit = Vec::new();
+    for e in elts {
+        match resolve_str(e, consts) {
+            Some(s) => vals.push(s),
+            None => {
+                let text = expr_source_text(e, source);
+                vals.push(text.clone());
+                nonlit.push(text);
+            }
+        }
+    }
+    (vals, nonlit)
+}
+
+/// Best-effort textual representation of an expression: its exact source slice
+/// (trimmed). Used to keep non-literal `@lineage` datasets readable.
+fn expr_source_text(expr: &Expr, source: &str) -> String {
+    let r = expr.range();
+    let start = r.start().to_usize();
+    let end = r.end().to_usize();
+    source
+        .get(start..end)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Final dotted segment of a callee expression: `task`, `tw.task` -> "task".
@@ -777,5 +969,129 @@ with DAG("medallion") as dag:
         // Both were recovered decorator-free, so the flag is set — this is what
         // drives the inferred job/edge/dataset origin in `scan_decl`.
         assert!(bronze.discovered && silver.discovered);
+    }
+
+    #[test]
+    fn lineage_recognised_under_all_import_forms() {
+        // The four documented import forms must all be recognised as one lineage
+        // task each: from-import, from-import-as, module + attr, module-as + attr.
+        let forms = [
+            r#"
+from traceweaver import lineage
+@lineage(inputs=["s3://b/in"], outputs=["iceberg://w.db.out"])
+def f():
+    pass
+"#,
+            r#"
+from traceweaver import lineage as track
+@track(inputs=["s3://b/in"], outputs=["iceberg://w.db.out"])
+def f():
+    pass
+"#,
+            r#"
+import traceweaver
+@traceweaver.lineage(inputs=["s3://b/in"], outputs=["iceberg://w.db.out"])
+def f():
+    pass
+"#,
+            r#"
+import traceweaver as tw
+@tw.lineage(inputs=["s3://b/in"], outputs=["iceberg://w.db.out"])
+def f():
+    pass
+"#,
+        ];
+        for (i, src) in forms.iter().enumerate() {
+            let m = extract_task_decls(src).unwrap();
+            assert_eq!(m.tasks.len(), 1, "form {i}: {src}");
+            let d = &m.tasks[0];
+            assert!(d.lineage, "form {i} should be a lineage decl");
+            assert_eq!(d.inputs, vec!["s3://b/in"], "form {i}");
+            assert_eq!(d.outputs, vec!["iceberg://w.db.out"], "form {i}");
+            assert!(d.nonliteral.is_empty(), "form {i}: all literal");
+        }
+    }
+
+    #[test]
+    fn bare_lineage_marks_with_no_datasets() {
+        let src = r#"
+from traceweaver import lineage
+@lineage
+def f():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        assert_eq!(m.tasks.len(), 1);
+        let d = &m.tasks[0];
+        assert!(d.lineage);
+        assert!(d.inputs.is_empty() && d.outputs.is_empty());
+    }
+
+    #[test]
+    fn lineage_name_and_description_and_templates() {
+        // name= overrides the task name; a string literal WITH a {placeholder}
+        // is still a literal template (high confidence, not flagged non-literal).
+        let src = r#"
+from traceweaver import lineage
+@lineage(
+    inputs=["s3://raw/sales/{date}.parquet"],
+    outputs=["iceberg://warehouse.sales.bronze"],
+    name="ingest_sales",
+    description="daily ingest",
+)
+def build():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.task_name, "ingest_sales");
+        assert_eq!(d.description.as_deref(), Some("daily ingest"));
+        assert_eq!(d.inputs, vec!["s3://raw/sales/{date}.parquet"]);
+        assert!(
+            d.nonliteral.is_empty(),
+            "a templated literal is still literal"
+        );
+    }
+
+    #[test]
+    fn lineage_keeps_non_literal_entries_as_text() {
+        // A non-literal entry (f-string) is KEPT as best-effort source text and
+        // recorded as non-literal; a sibling literal stays literal.
+        let src = r#"
+from traceweaver import lineage
+DAY = "2024-01-01"
+@lineage(
+    inputs=[f"s3://raw/{DAY}.parquet", "s3://raw/static.parquet"],
+    outputs=["iceberg://w.db.t"],
+)
+def build():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs.len(), 2);
+        assert_eq!(d.inputs[1], "s3://raw/static.parquet");
+        // The f-string is kept verbatim as source text and flagged non-literal.
+        assert!(d.inputs[0].contains("f\"s3://raw/"));
+        assert!(d.nonliteral.contains(&d.inputs[0]));
+        assert!(!d.nonliteral.contains(&d.inputs[1]));
+    }
+
+    #[test]
+    fn lineage_wins_over_colocated_airflow_task() {
+        // Stacked with Airflow's @task (final segment "task"): the @lineage
+        // declaration owns the task, so inputs/outputs come from @lineage.
+        let src = r#"
+from traceweaver import lineage
+from airflow.decorators import task
+@task
+@lineage(inputs=["s3://b/in"], outputs=["s3://b/out"])
+def f():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        assert_eq!(m.tasks.len(), 1);
+        assert!(m.tasks[0].lineage);
+        assert_eq!(m.tasks[0].outputs, vec!["s3://b/out"]);
     }
 }

@@ -64,7 +64,7 @@ LABEL org.opencontainers.image.title="trace-weaver" \
       org.opencontainers.image.description="trace-weaver data-lineage compiler: scans annotated Python Airflow DAGs into the weave universal JSON format and exports to OpenMetadata / OpenLineage / DOT." \
       org.opencontainers.image.source="https://github.com/ccyrene/trace-weaver" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="0.1.0"
+      org.opencontainers.image.version="0.2.0"
 
 ENTRYPOINT ["trace-weaver"]
 CMD ["--help"]
