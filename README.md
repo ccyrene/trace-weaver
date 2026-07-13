@@ -150,6 +150,9 @@ trace-weaver export --to <openmetadata|openlineage|dot> <doc.weave.json>
                     [--ol-producer URI] [--timeout S] [--retries N]
                     [--fail-on-partial]
 trace-weaver graph <doc.weave.json> [-o out.dot]      # shortcut for export --to dot
+trace-weaver gate --repo-path P [--git-ref R]
+                  [--min-task-coverage F] [--min-high-confidence F]
+                  [--format text|json]
 ```
 
 - **`scan`** walks a file or directory of `.py` DAGs and writes the weave IR.
@@ -159,6 +162,8 @@ trace-weaver graph <doc.weave.json> [-o out.dot]      # shortcut for export --to
   off-endpoint columns, …).
 - **`export`** sends the document to a catalogue. `--dry-run` builds the request
   bodies / artifact and performs **no** network I/O.
+- **`gate`** scans a repo and fails CI when lineage coverage/confidence falls
+  below a threshold (see [CI lineage gate](#ci-lineage-gate) below).
 - **Exit codes:** `0` success; `1` on error or a tripped `--strict` /
   `--fail-on-partial` gate.
 - **OpenMetadata auth:** the ingestion-bot JWT is read from `--om-token-file`,
@@ -176,6 +181,127 @@ trace-weaver graph <doc.weave.json> [-o out.dot]      # shortcut for export --to
 - **`dot`** (`graphviz`) — a Graphviz DOT graph; edges with any inferred lineage
   are drawn dashed/orange.
 
+### CI lineage gate
+
+`trace-weaver gate` turns a scan into a pass/fail check so a PR can be blocked when
+lineage regresses. It scans `--repo-path` (optionally as of `--git-ref`) and
+compares two metrics against thresholds:
+
+- **`task_coverage`** — fraction of tasks (jobs) that carry at least one lineage
+  edge.
+- **`high_confidence_fraction`** — fraction of edges that are **declared**
+  (high confidence) rather than inferred from SQL/code or reconstructed from a
+  non-literal `@lineage` dataset.
+
+```bash
+# Fail the build if fewer than 80% of tasks have lineage, or under 50% of
+# edges are declared. The JSON format adds a per-DAG breakdown.
+trace-weaver gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+trace-weaver gate --repo-path dags --format json
+```
+
+Thresholds may also come from the environment — `TRACEWEAVER_MIN_TASK_COVERAGE`
+and `TRACEWEAVER_MIN_HIGH_CONFIDENCE` — and an explicit flag always wins over the
+env var. **Exit codes:** `0` pass, `1` a threshold failed (the failing metric is
+printed), `2` usage error (bad path, unparseable threshold, invalid `--format`).
+
+#### Running `gate` in CI
+
+Once a release is published (see [Publishing](#publishing-docker-hub) below),
+pull the image instead of building from source. `gate` never writes a file, so
+a plain bind mount at the image's `WORKDIR` (`/work`) is enough — no volume
+permission juggling needed (contrast `scan -o`, which writes into the mount
+and does need it — see [Running via Docker](#running-via-docker)):
+
+```bash
+docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+  gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+**GitHub Actions:**
+
+```yaml
+name: lineage-gate
+on: [pull_request]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: trace-weaver lineage gate
+        run: |
+          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+            gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+**Bitbucket Pipelines** (needs the `docker` service to run `docker run` inside
+a step):
+
+```yaml
+definitions:
+  services:
+    docker:
+      memory: 2048
+
+pipelines:
+  pull-requests:
+    '**':
+      - step:
+          name: trace-weaver lineage gate
+          services:
+            - docker
+          script:
+            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.2.0
+                gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+```
+
+Swap `<dockerhub-namespace>` for the `DOCKERHUB_USERNAME` the image was
+published under, and pin to a release tag (`:0.2.0`) rather than `:latest` for
+a reproducible gate.
+
+---
+
+## Lineage decorator (`@lineage`)
+
+For **dataset-level** lineage that the code analyzer can't see (an external API,
+an opaque UDF, a step that shells out), declare the datasets a task reads and
+writes with the `@lineage` decorator. Like the rest of the SDK it is a **runtime
+no-op** — it returns your function unchanged and only attaches
+`__traceweaver_lineage__` — and the scanner reads it statically without importing
+your module.
+
+```python
+from trace_weaver import lineage
+
+@lineage(
+    inputs=["s3://acme-raw/sales/{ds}/events.parquet"],   # {ds} template is fine
+    outputs=["iceberg://warehouse.sales.bronze_events"],
+    name="ingest_sales_events",          # optional: overrides the task name
+    description="Land raw S3 events into bronze.",
+)
+def build_bronze():
+    ...
+
+@lineage            # bare form: marks the function, declares no datasets
+def touch():
+    ...
+```
+
+- `inputs` / `outputs` are lists of dataset **URI strings** (`s3://`, `iceberg://`,
+  `postgresql://`, `mongodb://`, `file://`, or an Airflow conn-id ref). A string
+  may contain `{placeholders}` — it is still treated as one declared dataset.
+- The scanner recognises every import form: `from trace_weaver import lineage`,
+  `... import lineage as X`, `import trace_weaver` + `@trace_weaver.lineage`, and
+  `import trace_weaver as tw` + `@tw.lineage`. It also works **stacked with
+  Airflow's `@task`** in any order.
+- **Confidence:** a string-literal dataset is **declared / high confidence**; a
+  non-literal entry (an f-string, a variable, a call) is kept as a best-effort
+  textual representation and marked **medium confidence** (inferred) so the gate
+  and exporters can tell it apart.
+
+See [`examples/sample_dags/declared_lineage.py`](examples/sample_dags/declared_lineage.py)
+for a full DAG.
+
 ---
 
 ## Optional: the Python authoring SDK (`@tw`)
@@ -188,6 +314,19 @@ returns your function unchanged, so your DAGs run exactly as before.
 ```bash
 cd python && pip install -e .        # stdlib only, Python 3.9+
 ```
+
+### Installing in an Airflow image
+
+DAG code runs inside your Airflow image, not this repo, so install the SDK
+straight from GitHub — no local checkout needed:
+
+```bash
+pip install "trace-weaver @ git+https://github.com/ccyrene/trace-weaver@main#subdirectory=python"
+```
+
+This tracks the `main` branch. Once a versioned tag is released, pin to it
+instead (e.g. `@v0.2.0#subdirectory=python`) — a tag will be preferred over
+`@main` as soon as one exists, for reproducible image builds.
 
 ```python
 import trace_weaver as tw
@@ -255,6 +394,58 @@ ruff check python examples                                       # Python SDK + 
 ```
 
 Rust 2021 edition, MSRV 1.80.
+
+## Running via Docker
+
+The `Dockerfile` is a two-stage build: a `builder` stage compiles a stripped
+release binary, and a `debian:bookworm-slim` `runtime` stage carries just the
+binary + CA roots, running as a fixed non-root `traceweaver` user (uid/gid
+`10001`). `WORKDIR` is `/work` and `ENTRYPOINT` is `["trace-weaver"]`, so any
+CLI subcommand is just appended as `docker run` arguments:
+
+```bash
+docker build -t trace-weaver:0.2.0 .
+
+# Read-only commands (gate, validate, export --dry-run): bind-mount the repo
+# at /work — no special permissions needed since nothing is written back.
+docker run --rm -v "$PWD:/work" trace-weaver:0.2.0 \
+  gate --repo-path examples/sample_dags --min-task-coverage 0.5
+
+# Commands that write into the mount (scan -o, export -o, graph -o): pass
+# --user "$(id -u):$(id -g)" so the container writes as YOUR uid, not the
+# image's fixed uid 10001 (which the bind-mounted host directory doesn't
+# grant write access to).
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.2.0 \
+  scan examples/sample_dags -o /work/out.weave.json
+```
+
+Once an image is published (below), swap the locally-built `trace-weaver:0.2.0`
+tag for `<dockerhub-namespace>/trace-weaver:0.2.0`.
+
+## Publishing (Docker Hub)
+
+`.github/workflows/publish.yml` builds the production image and pushes it to
+Docker Hub as `docker.io/$DOCKERHUB_USERNAME/trace-weaver` (tags `{version}` and
+`latest`). It runs on a pushed `v*` tag and via manual `workflow_dispatch`. It
+requires two **repository secrets**:
+
+| secret               | purpose                                            |
+|----------------------|----------------------------------------------------|
+| `DOCKERHUB_USERNAME` | Docker Hub account/namespace to push under         |
+| `DOCKERHUB_TOKEN`    | Docker Hub access token (used by `docker/login-action`) |
+
+The existing `ci.yml` gates are unchanged; publishing is a separate workflow.
+
+**Make the Docker Hub repository public.** The workflow only pushes; it never
+flips repo visibility. A private repo means every `docker pull` — including
+the [CI gate examples](#running-gate-in-ci) above and anyone else's `docker
+run` — needs Docker Hub credentials. Set the repository (create it once,
+manually, under the `DOCKERHUB_USERNAME` namespace, or via Docker Hub's own
+settings after the first push) to **public** so it can be pulled anonymously.
+
+## Changelog
+
+See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

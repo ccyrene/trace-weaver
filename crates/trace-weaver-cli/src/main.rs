@@ -8,13 +8,13 @@
 //! ```
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use trace_weaver_core::{has_errors, validate, DiagLevel, WeaveDocument};
+use trace_weaver_core::{has_errors, validate, DiagLevel, Job, WeaveDocument};
 use trace_weaver_export::{export, ExportConfig, Target};
 use trace_weaver_scan::{scan_path, ScanOptions};
 
@@ -46,6 +46,8 @@ enum Command {
     Export(ExportArgs),
     /// Shortcut for `export --to dot`.
     Graph(GraphArgs),
+    /// Gate CI on lineage coverage/confidence thresholds computed from a scan.
+    Gate(GateArgs),
 }
 
 #[derive(Args)]
@@ -133,6 +135,36 @@ struct GraphArgs {
     out: Option<PathBuf>,
 }
 
+/// Output format for the `gate` report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum GateFormat {
+    /// A human-readable metric table with PASS/FAIL lines.
+    Text,
+    /// A machine-readable JSON object (includes the per-DAG breakdown).
+    Json,
+}
+
+#[derive(Args)]
+struct GateArgs {
+    /// Directory (or file) of DAG code to scan and gate.
+    #[arg(long)]
+    repo_path: PathBuf,
+    /// Scan the repo as of this git ref instead of the working tree.
+    #[arg(long)]
+    git_ref: Option<String>,
+    /// Minimum acceptable fraction of tasks that carry lineage (0.0–1.0).
+    /// Falls back to $TRACEWEAVER_MIN_TASK_COVERAGE, then 0.0. Flag wins.
+    #[arg(long)]
+    min_task_coverage: Option<f64>,
+    /// Minimum acceptable fraction of edges that are high-confidence (declared).
+    /// Falls back to $TRACEWEAVER_MIN_HIGH_CONFIDENCE, then 0.0. Flag wins.
+    #[arg(long)]
+    min_high_confidence: Option<f64>,
+    /// Report format.
+    #[arg(long, value_enum, default_value_t = GateFormat::Text)]
+    format: GateFormat,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -140,6 +172,9 @@ fn main() -> Result<()> {
         Command::Validate(a) => cmd_validate(a),
         Command::Export(a) => cmd_export(a),
         Command::Graph(a) => cmd_graph(a),
+        // `gate` owns its exit codes (0 pass / 1 threshold fail / 2 usage error),
+        // so it bypasses the anyhow `Result` path and exits explicitly.
+        Command::Gate(a) => std::process::exit(cmd_gate(a)),
     }
 }
 
@@ -267,6 +302,370 @@ fn cmd_graph(a: GraphArgs) -> Result<()> {
     Ok(())
 }
 
+// ── gate ──
+
+/// Lineage metrics for one DAG (or the whole document).
+#[derive(Debug, Clone, PartialEq)]
+struct DagMetrics {
+    dag: String,
+    tasks_total: usize,
+    tasks_with_lineage: usize,
+    task_coverage: f64,
+    edges_total: usize,
+    high_confidence_edges: usize,
+    high_confidence_fraction: f64,
+}
+
+/// The full metric set a gate run evaluates: document totals + per-DAG breakdown.
+#[derive(Debug, Clone, PartialEq)]
+struct GateMetrics {
+    tasks_total: usize,
+    tasks_with_lineage: usize,
+    task_coverage: f64,
+    edges_total: usize,
+    high_confidence_edges: usize,
+    high_confidence_fraction: f64,
+    per_dag: Vec<DagMetrics>,
+}
+
+/// `n / d`, guarded: returns `empty` when the denominator is zero.
+fn frac(n: usize, d: usize, empty: f64) -> f64 {
+    if d == 0 {
+        empty
+    } else {
+        n as f64 / d as f64
+    }
+}
+
+/// Compute lineage gate metrics from a scanned document.
+///
+/// * A task "has lineage" when at least one edge is attributed to its job.
+/// * "high confidence" == a **declared** (not inferred) edge — literal `@lineage`
+///   / `@tw` declarations are declared; SQL/code-inferred and non-literal
+///   `@lineage` datasets are not.
+/// * `task_coverage` is 0.0 for a document with no tasks; `high_confidence_fraction`
+///   is 1.0 for a document with no edges (nothing low-confidence to count).
+fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let jobs_with_edges: HashSet<&str> =
+        doc.edges.iter().filter_map(|e| e.job.as_deref()).collect();
+    let job_by_id: HashMap<&str, &Job> = doc.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
+    let dag_of = |j: &Job| j.dag.clone().unwrap_or_else(|| "default".to_string());
+
+    // (tasks_total, tasks_with_lineage, edges_total, high_confidence_edges)
+    let mut by_dag: BTreeMap<String, [usize; 4]> = BTreeMap::new();
+    for j in &doc.jobs {
+        let e = by_dag.entry(dag_of(j)).or_default();
+        e[0] += 1;
+        if jobs_with_edges.contains(j.id.as_str()) {
+            e[1] += 1;
+        }
+    }
+    for edge in &doc.edges {
+        let dag = edge
+            .job
+            .as_deref()
+            .and_then(|id| job_by_id.get(id))
+            .map(|j| dag_of(j))
+            .unwrap_or_else(|| "default".to_string());
+        let e = by_dag.entry(dag).or_default();
+        e[2] += 1;
+        if !edge.origin.is_inferred() {
+            e[3] += 1;
+        }
+    }
+
+    let per_dag: Vec<DagMetrics> = by_dag
+        .into_iter()
+        .map(|(dag, c)| DagMetrics {
+            dag,
+            tasks_total: c[0],
+            tasks_with_lineage: c[1],
+            task_coverage: frac(c[1], c[0], 0.0),
+            edges_total: c[2],
+            high_confidence_edges: c[3],
+            high_confidence_fraction: frac(c[3], c[2], 1.0),
+        })
+        .collect();
+
+    let tasks_total = doc.jobs.len();
+    let tasks_with_lineage = doc
+        .jobs
+        .iter()
+        .filter(|j| jobs_with_edges.contains(j.id.as_str()))
+        .count();
+    let edges_total = doc.edges.len();
+    let high_confidence_edges = doc.edges.iter().filter(|e| !e.origin.is_inferred()).count();
+
+    GateMetrics {
+        tasks_total,
+        tasks_with_lineage,
+        task_coverage: frac(tasks_with_lineage, tasks_total, 0.0),
+        edges_total,
+        high_confidence_edges,
+        high_confidence_fraction: frac(high_confidence_edges, edges_total, 1.0),
+        per_dag,
+    }
+}
+
+/// Resolve a threshold: explicit `--flag` wins; otherwise the env var; otherwise
+/// `0.0` (no gate). A present-but-unparseable env var is a usage error.
+fn resolve_threshold(flag: Option<f64>, env: &str) -> Result<f64, String> {
+    if let Some(v) = flag {
+        return Ok(v);
+    }
+    match std::env::var(env) {
+        Ok(s) => s
+            .trim()
+            .parse::<f64>()
+            .map_err(|_| format!("environment variable {env}={s:?} is not a valid number")),
+        Err(_) => Ok(0.0),
+    }
+}
+
+/// Materialize `repo` at `git_ref` into a temp dir (via `git archive | tar`) and
+/// return the extracted root. Any failure is a usage error (bad ref / no git).
+fn materialize_git_ref(repo: &Path, git_ref: &str) -> Result<PathBuf, String> {
+    let repo_str = repo
+        .to_str()
+        .ok_or_else(|| "repo path is not valid UTF-8".to_string())?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp =
+        std::env::temp_dir().join(format!("trace-weaver-gate-{}-{stamp}", std::process::id()));
+    let src = tmp.join("src");
+    let tar = tmp.join("repo.tar");
+    fs::create_dir_all(&src).map_err(|e| format!("creating temp dir: {e}"))?;
+
+    let tar_str = tar.to_str().ok_or("temp path not UTF-8")?;
+    let src_str = src.to_str().ok_or("temp path not UTF-8")?;
+
+    let archive = std::process::Command::new("git")
+        .args([
+            "-C",
+            repo_str,
+            "archive",
+            "--format=tar",
+            "-o",
+            tar_str,
+            git_ref,
+        ])
+        .output()
+        .map_err(|e| format!("running git: {e}"))?;
+    if !archive.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "git archive {git_ref} failed: {}",
+            String::from_utf8_lossy(&archive.stderr).trim()
+        ));
+    }
+    let untar = std::process::Command::new("tar")
+        .args(["-xf", tar_str, "-C", src_str])
+        .output()
+        .map_err(|e| format!("running tar: {e}"))?;
+    if !untar.status.success() {
+        let _ = fs::remove_dir_all(&tmp);
+        return Err(format!(
+            "tar extract failed: {}",
+            String::from_utf8_lossy(&untar.stderr).trim()
+        ));
+    }
+    Ok(src)
+}
+
+fn cmd_gate(a: GateArgs) -> i32 {
+    let min_cov = match resolve_threshold(a.min_task_coverage, "TRACEWEAVER_MIN_TASK_COVERAGE") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+    let min_hc = match resolve_threshold(a.min_high_confidence, "TRACEWEAVER_MIN_HIGH_CONFIDENCE") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 2;
+        }
+    };
+
+    // Resolve the scan root: the working tree, or a temp checkout of --git-ref.
+    let git_tmp: Option<PathBuf>;
+    let root: PathBuf = match a.git_ref.as_deref() {
+        Some(git_ref) => match materialize_git_ref(&a.repo_path, git_ref) {
+            Ok(p) => {
+                git_tmp = Some(p.clone());
+                p
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return 2;
+            }
+        },
+        None => {
+            git_tmp = None;
+            a.repo_path.clone()
+        }
+    };
+
+    if !root.exists() {
+        eprintln!("error: repo path does not exist: {}", root.display());
+        cleanup_git_tmp(&git_tmp);
+        return 2;
+    }
+
+    let opts = ScanOptions::default();
+    let doc = match scan_path(&root, &opts) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: scan failed: {e}");
+            cleanup_git_tmp(&git_tmp);
+            return 2;
+        }
+    };
+    cleanup_git_tmp(&git_tmp);
+
+    let m = compute_gate_metrics(&doc);
+    let cov_pass = m.task_coverage >= min_cov;
+    let hc_pass = m.high_confidence_fraction >= min_hc;
+    let passed = cov_pass && hc_pass;
+
+    match a.format {
+        GateFormat::Json => print_gate_json(&m, min_cov, min_hc, cov_pass, hc_pass, passed),
+        GateFormat::Text => print_gate_text(&m, min_cov, min_hc, cov_pass, hc_pass, passed),
+    }
+
+    if passed {
+        0
+    } else {
+        1
+    }
+}
+
+fn cleanup_git_tmp(git_tmp: &Option<PathBuf>) {
+    if let Some(t) = git_tmp {
+        // Remove the whole temp root (parent of the extracted `src`).
+        if let Some(parent) = t.parent() {
+            let _ = fs::remove_dir_all(parent);
+        }
+    }
+}
+
+fn print_gate_text(
+    m: &GateMetrics,
+    min_cov: f64,
+    min_hc: f64,
+    cov_pass: bool,
+    hc_pass: bool,
+    passed: bool,
+) {
+    let mark = |ok: bool| if ok { "PASS" } else { "FAIL" };
+    println!("trace-weaver lineage gate");
+    println!("  tasks_total               {}", m.tasks_total);
+    println!("  tasks_with_lineage        {}", m.tasks_with_lineage);
+    println!("  task_coverage             {:.3}", m.task_coverage);
+    println!("  edges_total               {}", m.edges_total);
+    println!("  high_confidence_edges     {}", m.high_confidence_edges);
+    println!(
+        "  high_confidence_fraction  {:.3}",
+        m.high_confidence_fraction
+    );
+    if !m.per_dag.is_empty() {
+        println!("  per-DAG:");
+        for d in &m.per_dag {
+            println!(
+                "    {:<24} coverage {:.3} ({}/{})  high-conf {:.3} ({}/{})",
+                d.dag,
+                d.task_coverage,
+                d.tasks_with_lineage,
+                d.tasks_total,
+                d.high_confidence_fraction,
+                d.high_confidence_edges,
+                d.edges_total,
+            );
+        }
+    }
+    println!();
+    println!(
+        "  [{}] task_coverage {:.3} >= {:.3} (min)",
+        mark(cov_pass),
+        m.task_coverage,
+        min_cov
+    );
+    println!(
+        "  [{}] high_confidence_fraction {:.3} >= {:.3} (min)",
+        mark(hc_pass),
+        m.high_confidence_fraction,
+        min_hc
+    );
+    println!();
+    println!("gate: {}", if passed { "PASS" } else { "FAIL" });
+    if !passed {
+        if !cov_pass {
+            eprintln!(
+                "gate failed: task_coverage {:.3} < min {:.3}",
+                m.task_coverage, min_cov
+            );
+        }
+        if !hc_pass {
+            eprintln!(
+                "gate failed: high_confidence_fraction {:.3} < min {:.3}",
+                m.high_confidence_fraction, min_hc
+            );
+        }
+    }
+}
+
+fn print_gate_json(
+    m: &GateMetrics,
+    min_cov: f64,
+    min_hc: f64,
+    cov_pass: bool,
+    hc_pass: bool,
+    passed: bool,
+) {
+    let per_dag: Vec<serde_json::Value> = m
+        .per_dag
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "dag": d.dag,
+                "tasks_total": d.tasks_total,
+                "tasks_with_lineage": d.tasks_with_lineage,
+                "task_coverage": d.task_coverage,
+                "edges_total": d.edges_total,
+                "high_confidence_edges": d.high_confidence_edges,
+                "high_confidence_fraction": d.high_confidence_fraction,
+            })
+        })
+        .collect();
+    let obj = serde_json::json!({
+        "tasks_total": m.tasks_total,
+        "tasks_with_lineage": m.tasks_with_lineage,
+        "task_coverage": m.task_coverage,
+        "edges_total": m.edges_total,
+        "high_confidence_edges": m.high_confidence_edges,
+        "high_confidence_fraction": m.high_confidence_fraction,
+        "thresholds": {
+            "min_task_coverage": min_cov,
+            "min_high_confidence": min_hc,
+        },
+        "checks": {
+            "task_coverage": cov_pass,
+            "high_confidence_fraction": hc_pass,
+        },
+        "passed": passed,
+        "per_dag": per_dag,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&obj).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
 // ── helpers ──
 
 fn load_doc(path: &PathBuf) -> Result<WeaveDocument> {
@@ -328,4 +727,87 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trace_weaver_core::{Dataset, Edge, Engine, Origin};
+
+    fn job(dag: &str, name: &str, inputs: &[&str], outputs: &[&str]) -> Job {
+        let mut j = Job::new(format!("{dag}.{name}"), name, Engine::Python);
+        j.dag = Some(dag.to_string());
+        j.inputs = inputs.iter().map(|s| s.to_string()).collect();
+        j.outputs = outputs.iter().map(|s| s.to_string()).collect();
+        j
+    }
+
+    fn edge(from: &str, to: &str, job_id: &str, inferred: bool) -> Edge {
+        let mut e = Edge::new(from, to);
+        e.job = Some(job_id.to_string());
+        e.origin = if inferred {
+            Origin::inferred_code(0.5)
+        } else {
+            Origin::declared()
+        };
+        e
+    }
+
+    #[test]
+    fn metrics_count_coverage_and_confidence() {
+        let mut doc = WeaveDocument::new("ns", "test");
+        for d in ["a", "b", "c"] {
+            doc.datasets.push(Dataset::new(d));
+        }
+        // Two DAGs. dag1: one task with a declared edge. dag2: one task with an
+        // inferred edge + one task with NO lineage (bare marker).
+        doc.jobs.push(job("dag1", "t1", &["a"], &["b"]));
+        doc.jobs.push(job("dag2", "t2", &["b"], &["c"]));
+        doc.jobs.push(job("dag2", "t3", &[], &[]));
+        doc.edges.push(edge("a", "b", "dag1.t1", false));
+        doc.edges.push(edge("b", "c", "dag2.t2", true));
+
+        let m = compute_gate_metrics(&doc);
+        assert_eq!(m.tasks_total, 3);
+        assert_eq!(m.tasks_with_lineage, 2); // t1, t2 (t3 has no edge)
+        assert!((m.task_coverage - 2.0 / 3.0).abs() < 1e-9);
+        assert_eq!(m.edges_total, 2);
+        assert_eq!(m.high_confidence_edges, 1); // only the declared a->b
+        assert!((m.high_confidence_fraction - 0.5).abs() < 1e-9);
+
+        // Per-DAG breakdown.
+        let d1 = m.per_dag.iter().find(|d| d.dag == "dag1").unwrap();
+        assert_eq!((d1.tasks_total, d1.tasks_with_lineage), (1, 1));
+        assert_eq!(d1.high_confidence_fraction, 1.0);
+        let d2 = m.per_dag.iter().find(|d| d.dag == "dag2").unwrap();
+        assert_eq!((d2.tasks_total, d2.tasks_with_lineage), (2, 1));
+        assert_eq!(d2.task_coverage, 0.5);
+        assert_eq!(d2.high_confidence_fraction, 0.0); // its one edge is inferred
+    }
+
+    #[test]
+    fn empty_document_is_zero_coverage_but_vacuous_high_confidence() {
+        let doc = WeaveDocument::new("ns", "test");
+        let m = compute_gate_metrics(&doc);
+        assert_eq!(m.tasks_total, 0);
+        assert_eq!(m.task_coverage, 0.0);
+        assert_eq!(m.edges_total, 0);
+        assert_eq!(m.high_confidence_fraction, 1.0);
+    }
+
+    #[test]
+    fn threshold_flag_beats_env_and_bad_env_is_usage_error() {
+        // Flag wins over env.
+        std::env::set_var("TW_TEST_MIN", "0.4");
+        assert_eq!(resolve_threshold(Some(0.9), "TW_TEST_MIN").unwrap(), 0.9);
+        // Env used when no flag.
+        assert_eq!(resolve_threshold(None, "TW_TEST_MIN").unwrap(), 0.4);
+        // Unset env -> default 0.0.
+        std::env::remove_var("TW_TEST_MIN");
+        assert_eq!(resolve_threshold(None, "TW_TEST_MIN").unwrap(), 0.0);
+        // Present-but-garbage env -> usage error.
+        std::env::set_var("TW_TEST_MIN", "not-a-number");
+        assert!(resolve_threshold(None, "TW_TEST_MIN").is_err());
+        std::env::remove_var("TW_TEST_MIN");
+    }
 }

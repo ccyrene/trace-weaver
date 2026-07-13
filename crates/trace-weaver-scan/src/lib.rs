@@ -77,6 +77,19 @@ const SQL_CONFIDENCE: f32 = 0.85;
 /// than SQL (looser semantics), higher than the same-name identity gap-fill.
 const CODE_DATAFLOW_CONFIDENCE: f32 = 0.7;
 
+/// Confidence for a `@lineage` dataset that was declared as a non-literal (an
+/// f-string / name / call): the engineer's intent is real but the exact URI is
+/// only a best-effort textual reconstruction, so it is "medium".
+const LINEAGE_MEDIUM_CONFIDENCE: f32 = 0.5;
+
+/// Provenance note stamped on structural elements of a `@lineage` task. Contains
+/// the marker substring `@lineage` so the finalize pass can recognise
+/// dataset-level lineage and skip the "no column lineage" advisory for it.
+const LINEAGE_NOTE: &str = "@lineage declared dataset-level lineage";
+
+/// Provenance note for a `@lineage` endpoint declared as a non-literal.
+const LINEAGE_NONLITERAL_NOTE: &str = "@lineage non-literal dataset (best-effort text)";
+
 /// Recursively scan every `*.py` file under `root` and assemble one document.
 ///
 /// After collecting all files this derives any missing job-level edges,
@@ -145,7 +158,15 @@ fn finalize(doc: &mut WeaveDocument, opts: &ScanOptions) {
     // engineers should declare a `column_map` for it.
     let mut warnings = Vec::new();
     for e in &doc.edges {
-        if e.column_lineage.is_empty() {
+        // A `@lineage` edge is declarative dataset-level lineage by design — it
+        // has no column map to extract, so the "declare a column_map" advisory
+        // does not apply. Recognise it by the `@lineage` marker in its origin note.
+        let is_lineage_edge = e
+            .origin
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains("@lineage"));
+        if e.column_lineage.is_empty() && !is_lineage_edge {
             let loc = e
                 .job
                 .as_ref()
@@ -291,8 +312,31 @@ fn scan_decl(
     // declared. (Column-level origin is set independently per mapping below.)
     let element_origin = if decl.discovered {
         discovered_origin(engine)
+    } else if decl.lineage {
+        // A @lineage task is hand-declared, but tagged so exporters/finalize can
+        // tell it apart as declarative dataset-level lineage.
+        Origin::declared().with_note(LINEAGE_NOTE)
     } else {
         Origin::declared()
+    };
+
+    // For a @lineage task, non-literal dataset entries carry medium (inferred)
+    // confidence while literal entries stay declared/high. The recorded
+    // non-literal texts are FQN-expanded so they match `inputs`/`outputs`.
+    let nonliteral: std::collections::HashSet<String> = if decl.lineage {
+        decl.nonliteral
+            .iter()
+            .map(|n| expand_fqn(n, config))
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    let endpoint_origin = |name: &str| -> Origin {
+        if nonliteral.contains(name) {
+            Origin::inferred_code(LINEAGE_MEDIUM_CONFIDENCE).with_note(LINEAGE_NONLITERAL_NOTE)
+        } else {
+            element_origin.clone()
+        }
     };
 
     // ── Hygiene diagnostics (findings #6, #10; I/O still required) ───────
@@ -330,7 +374,7 @@ fn scan_decl(
 
     // 1. Upsert datasets for every input and output.
     for ds_name in inputs.iter().chain(outputs.iter()) {
-        doc.upsert_dataset(build_dataset(ds_name, &element_origin));
+        doc.upsert_dataset(build_dataset(ds_name, &endpoint_origin(ds_name)));
     }
 
     // 2. Build the job. Tier 2: default the DAG from configure()/`with DAG(...)`.
@@ -418,7 +462,11 @@ fn scan_decl(
                 description: decl.description.clone(),
                 sql: decl.sql.clone(),
             };
-            edge.origin = element_origin.clone();
+            edge.origin = if nonliteral.contains(input) || nonliteral.contains(output) {
+                Origin::inferred_code(LINEAGE_MEDIUM_CONFIDENCE).with_note(LINEAGE_NONLITERAL_NOTE)
+            } else {
+                element_origin.clone()
+            };
 
             for ce in &col_edges {
                 let attach = if ce.from_columns.is_empty() {
@@ -449,8 +497,10 @@ fn emit_decl_diagnostics(
     loc: &SourceLoc,
     doc: &mut WeaveDocument,
 ) {
-    // inputs and outputs are mandatory for a data-producing task.
-    if inputs.is_empty() || outputs.is_empty() {
+    // inputs and outputs are mandatory for a data-producing task — except a
+    // `@lineage` marker, which is declarative and may legitimately declare only
+    // one side (or, in its bare form, none).
+    if !decl.lineage && (inputs.is_empty() || outputs.is_empty()) {
         doc.diagnostics.push(
             Diagnostic::error(
                 "E_MISSING_IO",
@@ -494,8 +544,13 @@ fn emit_decl_diagnostics(
     }
     // (#10) dataset FQNs that aren't 4-part are accepted but won't export to OM.
     // After Tier 1 expansion this only fires when there's no configure() default
-    // and the engineer wrote a bare name.
+    // and the engineer wrote a bare name. `@lineage` datasets are intentionally
+    // dataset URIs (s3://, iceberg://, conn refs), not OM FQNs, so the OM-export
+    // advisory would be pure noise for them — skip it.
     for ds_name in inputs.iter().chain(outputs.iter()) {
+        if decl.lineage {
+            continue;
+        }
         if FqnParts::parse(ds_name).is_none() {
             doc.diagnostics.push(
                 Diagnostic::warn(
@@ -1294,5 +1349,110 @@ def t():
             !codes.contains(&"W_OPAQUE_COLUMN"),
             "declared column 'y' must not raise W_OPAQUE_COLUMN: {codes:?}"
         );
+    }
+
+    #[test]
+    fn lineage_literal_datasets_are_declared_high_confidence() {
+        // A @lineage task with literal URIs: datasets + edge are DECLARED (high),
+        // and the OM-FQN / missing-column advisories do NOT fire (URIs, not FQNs).
+        let src = r#"
+from traceweaver import lineage
+@lineage(
+    inputs=["s3://raw-bucket/sales/{date}.parquet"],
+    outputs=["iceberg://warehouse.sales.bronze"],
+    description="daily ingest",
+)
+def build_bronze():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag.py", src, &opts(), &mut doc).unwrap();
+
+        assert_eq!(doc.jobs.len(), 1);
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert_eq!(edge.from, "s3://raw-bucket/sales/{date}.parquet");
+        assert_eq!(edge.to, "iceberg://warehouse.sales.bronze");
+        assert!(
+            !edge.origin.is_inferred(),
+            "literal @lineage edge is declared"
+        );
+        assert!(doc.datasets.iter().all(|d| !d.origin.is_inferred()));
+        // No hygiene noise for a URI-based dataset-level declaration.
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(!codes.contains(&"W_BAD_FQN"), "{codes:?}");
+        assert!(!codes.contains(&"E_MISSING_IO"), "{codes:?}");
+    }
+
+    #[test]
+    fn lineage_non_literal_dataset_is_medium_confidence() {
+        // A non-literal input (f-string) => the input dataset and the edge it
+        // touches are INFERRED (medium), while the literal output stays declared.
+        let src = r#"
+from traceweaver import lineage
+DAY = "2024-01-01"
+@lineage(
+    inputs=[f"s3://raw/{DAY}.parquet"],
+    outputs=["iceberg://w.db.bronze"],
+)
+def build():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag.py", src, &opts(), &mut doc).unwrap();
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert!(
+            edge.origin.is_inferred(),
+            "an edge touching a non-literal endpoint is medium/inferred"
+        );
+        assert_eq!(
+            edge.origin.confidence,
+            Some(LINEAGE_MEDIUM_CONFIDENCE),
+            "non-literal @lineage confidence is medium"
+        );
+        // The literal output dataset is still declared/high.
+        let out = doc.dataset("iceberg://w.db.bronze").unwrap();
+        assert!(!out.origin.is_inferred());
+    }
+
+    #[test]
+    fn lineage_dataset_level_edge_does_not_warn_no_column_lineage() {
+        // @lineage is intentionally dataset-level, so the document post-pass must
+        // NOT nag it to "declare a column_map".
+        let doc = scan_one(
+            "trace_weaver_scan_test_lineage_nocl",
+            r#"
+from traceweaver import lineage
+@lineage(inputs=["s3://b/in"], outputs=["s3://b/out"])
+def f():
+    pass
+"#,
+        );
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(
+            !codes.contains(&"W_NO_COLUMN_LINEAGE"),
+            "dataset-level @lineage must not raise W_NO_COLUMN_LINEAGE: {codes:?}"
+        );
+        assert_eq!(doc.edges.len(), 1);
+    }
+
+    #[test]
+    fn bare_lineage_yields_a_job_with_no_edges_and_no_error() {
+        // Bare @lineage: the function is a task with no declared datasets. It must
+        // not error (E_MISSING_IO is suppressed) and contributes to task counts
+        // without any lineage edges — the exact "task without lineage" case the
+        // gate coverage metric measures.
+        let src = r#"
+from traceweaver import lineage
+@lineage
+def f():
+    pass
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag.py", src, &opts(), &mut doc).unwrap();
+        assert_eq!(doc.jobs.len(), 1);
+        assert!(doc.edges.is_empty());
+        assert!(!trace_weaver_core::has_errors(&doc.diagnostics));
     }
 }

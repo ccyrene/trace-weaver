@@ -1,0 +1,66 @@
+# Publish the trace-weaver image to Docker Hub.
+#
+# Builds the lean root Dockerfile and pushes to
+# docker.io/$DOCKERHUB_USERNAME/trace-weaver with tags {version} and latest.
+#
+# Triggers:
+#   * a pushed `v*` tag  -> version = the tag without its leading `v`
+#   * manual dispatch    -> version = the workspace Cargo version (or an override)
+#
+# Required repository secrets:
+#   DOCKERHUB_USERNAME  Docker Hub account/namespace to push under
+#   DOCKERHUB_TOKEN     Docker Hub access token (docker/login-action)
+#
+# This is separate from ci.yml; the CI gates are unchanged.
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version tag (defaults to the Cargo workspace version)"
+        required: false
+        type: string
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docker:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          elif [ -n "${{ github.event.inputs.version }}" ]; then
+            version="${{ github.event.inputs.version }}"
+          else
+            version="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Publishing version: ${version}"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        env:
+          IMAGE: docker.io/${{ secrets.DOCKERHUB_USERNAME }}/trace-weaver
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker build -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" .
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"

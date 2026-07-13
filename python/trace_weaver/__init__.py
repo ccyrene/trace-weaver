@@ -47,9 +47,22 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Tuple, TypeVar, Union
 
-__all__ = ["task", "sql", "configure", "config", "Dataset", "registry", "Declaration", "__version__"]
+from trace_weaver.decorators import LINEAGE_ATTR, lineage
 
-__version__ = "0.1.0"
+__all__ = [
+    "task",
+    "sql",
+    "lineage",
+    "LINEAGE_ATTR",
+    "configure",
+    "config",
+    "Dataset",
+    "registry",
+    "Declaration",
+    "__version__",
+]
+
+__version__ = "0.2.0"
 
 #: Allowed values for the ``engine`` argument. Kept here so the compiler and the
 #: SDK agree on a single source of truth, but the decorator does **not** enforce
