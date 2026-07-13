@@ -9,8 +9,8 @@
 # Build context is the repository root. Example DAGs are intentionally NOT baked
 # in: at runtime the user mounts their own DAGs as a volume under /work.
 #
-#   docker build -t trace-weaver:0.1.0 .
-#   docker run --rm -v "$PWD/dags:/work/dags" trace-weaver:0.1.0 scan dags -o /work/out.weave.json
+#   docker build -t trace-weaver:0.2.0 .
+#   docker run --rm -v "$PWD/dags:/work/dags" trace-weaver:0.2.0 scan dags -o /work/out.weave.json
 
 # ---------------------------------------------------------------------------
 # Stage 1: builder
