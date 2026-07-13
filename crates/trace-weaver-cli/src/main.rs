@@ -321,6 +321,8 @@ struct DagMetrics {
     edges_total: usize,
     high_confidence_edges: usize,
     high_confidence_fraction: f64,
+    column_edges: usize,
+    column_mappings: usize,
 }
 
 /// The full metric set a gate run evaluates: document totals + per-DAG breakdown.
@@ -334,6 +336,12 @@ struct GateMetrics {
     edges_total: usize,
     high_confidence_edges: usize,
     high_confidence_fraction: f64,
+    /// Report-only: edges recovered by the column-discovery pass (Pass C). These
+    /// live in a separate measurement dimension and are deliberately excluded
+    /// from `edges_total` / `high_confidence_fraction`.
+    column_edges: usize,
+    /// Report-only: total column-level mappings carried by those edges.
+    column_mappings: usize,
     per_dag: Vec<DagMetrics>,
 }
 
@@ -371,6 +379,13 @@ fn frac(n: usize, d: usize, empty: f64) -> f64 {
 /// * `task_coverage`/`annotation_coverage` are 0.0 for a document with no tasks;
 ///   `high_confidence_fraction` is 1.0 for a document with no edges (nothing
 ///   low-confidence to count).
+/// * **Column-discovery edges** (Pass C — job-less, always inferred hops the
+///   scanner recovered from a library call) are measured in a *separate*
+///   dimension: they are counted in `column_edges` / `column_mappings` and
+///   deliberately EXCLUDED from `edges_total` / `high_confidence_edges` /
+///   `high_confidence_fraction`. Folding them into the task-edge ratio would
+///   let column discovery in one dimension collapse another dimension's
+///   confidence — the same class of bug the annotation split fixed in v0.3.
 fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -379,8 +394,9 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
     let job_by_id: HashMap<&str, &Job> = doc.jobs.iter().map(|j| (j.id.as_str(), j)).collect();
     let dag_of = |j: &Job| j.dag.clone().unwrap_or_else(|| "default".to_string());
 
-    // (tasks_total, tasks_with_lineage, tasks_annotated, edges_total, high_confidence_edges)
-    let mut by_dag: BTreeMap<String, [usize; 5]> = BTreeMap::new();
+    // (tasks_total, tasks_with_lineage, tasks_annotated, edges_total,
+    //  high_confidence_edges, column_edges, column_mappings)
+    let mut by_dag: BTreeMap<String, [usize; 7]> = BTreeMap::new();
     for j in &doc.jobs {
         let e = by_dag.entry(dag_of(j)).or_default();
         e[0] += 1;
@@ -401,9 +417,16 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
             .map(|j| dag_of(j))
             .unwrap_or_else(|| "default".to_string());
         let e = by_dag.entry(dag).or_default();
-        e[3] += 1;
-        if !edge.origin.is_inferred() {
-            e[4] += 1;
+        // Column-discovery edges are tallied in their own dimension and kept out
+        // of the task-edge / high-confidence counts.
+        if edge.column_discovery {
+            e[5] += 1;
+            e[6] += edge.column_lineage.len();
+        } else {
+            e[3] += 1;
+            if !edge.origin.is_inferred() {
+                e[4] += 1;
+            }
         }
     }
 
@@ -419,6 +442,8 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
             edges_total: c[3],
             high_confidence_edges: c[4],
             high_confidence_fraction: frac(c[4], c[3], 1.0),
+            column_edges: c[5],
+            column_mappings: c[6],
         })
         .collect();
 
@@ -429,8 +454,20 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
         .filter(|j| jobs_with_edges.contains(j.id.as_str()))
         .count();
     let tasks_annotated = doc.jobs.iter().filter(|j| !j.origin.is_inferred()).count();
-    let edges_total = doc.edges.len();
-    let high_confidence_edges = doc.edges.iter().filter(|e| !e.origin.is_inferred()).count();
+    // Task/declared-scope edges only — column-discovery hops are excluded here.
+    let edges_total = doc.edges.iter().filter(|e| !e.column_discovery).count();
+    let high_confidence_edges = doc
+        .edges
+        .iter()
+        .filter(|e| !e.column_discovery && !e.origin.is_inferred())
+        .count();
+    let column_edges = doc.edges.iter().filter(|e| e.column_discovery).count();
+    let column_mappings = doc
+        .edges
+        .iter()
+        .filter(|e| e.column_discovery)
+        .map(|e| e.column_lineage.len())
+        .sum();
 
     GateMetrics {
         tasks_total,
@@ -441,6 +478,8 @@ fn compute_gate_metrics(doc: &WeaveDocument) -> GateMetrics {
         edges_total,
         high_confidence_edges,
         high_confidence_fraction: frac(high_confidence_edges, edges_total, 1.0),
+        column_edges,
+        column_mappings,
         per_dag,
     }
 }
@@ -642,11 +681,14 @@ fn print_gate_text(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
         "  high_confidence_fraction  {:.3}",
         m.high_confidence_fraction
     );
+    // Report-only column-discovery dimension (excluded from the ratios above).
+    println!("  column_edges              {}", m.column_edges);
+    println!("  column_mappings           {}", m.column_mappings);
     if !m.per_dag.is_empty() {
         println!("  per-DAG:");
         for d in &m.per_dag {
             println!(
-                "    {:<24} coverage {:.3} ({}/{})  annotated {:.3} ({}/{})  high-conf {:.3} ({}/{})",
+                "    {:<24} coverage {:.3} ({}/{})  annotated {:.3} ({}/{})  high-conf {:.3} ({}/{})  column-edges {} ({} mappings)",
                 d.dag,
                 d.task_coverage,
                 d.tasks_with_lineage,
@@ -657,6 +699,8 @@ fn print_gate_text(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
                 d.high_confidence_fraction,
                 d.high_confidence_edges,
                 d.edges_total,
+                d.column_edges,
+                d.column_mappings,
             );
         }
     }
@@ -718,6 +762,8 @@ fn print_gate_json(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
                 "edges_total": d.edges_total,
                 "high_confidence_edges": d.high_confidence_edges,
                 "high_confidence_fraction": d.high_confidence_fraction,
+                "column_edges": d.column_edges,
+                "column_mappings": d.column_mappings,
             })
         })
         .collect();
@@ -730,6 +776,8 @@ fn print_gate_json(m: &GateMetrics, t: &GateThresholds, c: &GateChecks) {
         "edges_total": m.edges_total,
         "high_confidence_edges": m.high_confidence_edges,
         "high_confidence_fraction": m.high_confidence_fraction,
+        "column_edges": m.column_edges,
+        "column_mappings": m.column_mappings,
         "thresholds": {
             "min_task_coverage": t.min_cov,
             "min_high_confidence": t.min_hc,
@@ -836,6 +884,22 @@ mod tests {
         e
     }
 
+    /// A column-discovery (Pass C) edge: job-less, inferred, carrying `mappings`
+    /// column-level mappings.
+    fn column_edge(from: &str, to: &str, mappings: usize) -> Edge {
+        use trace_weaver_core::{ColumnEdge, ColumnRef};
+        let mut e = Edge::new(from, to);
+        e.origin = Origin::inferred_code(0.4);
+        e.column_discovery = true;
+        for i in 0..mappings {
+            e.column_lineage.push(ColumnEdge::new(
+                vec![ColumnRef::new(from, format!("c{i}"))],
+                ColumnRef::new(to, format!("c{i}")),
+            ));
+        }
+        e
+    }
+
     #[test]
     fn metrics_count_coverage_and_confidence() {
         let mut doc = WeaveDocument::new("ns", "test");
@@ -866,6 +930,48 @@ mod tests {
         assert_eq!((d2.tasks_total, d2.tasks_with_lineage), (2, 1));
         assert_eq!(d2.task_coverage, 0.5);
         assert_eq!(d2.high_confidence_fraction, 0.0); // its one edge is inferred
+    }
+
+    #[test]
+    fn column_discovery_edges_are_excluded_from_task_edge_ratios() {
+        // Regression for the v0.5.1 production finding: column-discovery (Pass C)
+        // edges must NOT dilute edges_total / high_confidence_fraction. Here two
+        // declared task edges (both high-confidence) coexist with many inferred
+        // column-discovery edges. Without the split, high_confidence_fraction
+        // would collapse to 2/(2+3); with it, the task ratio stays 2/2 = 1.0 and
+        // the column dimension is reported on the side.
+        let mut doc = WeaveDocument::new("ns", "test");
+        for d in ["a", "b", "c", "cd1", "cd2", "cd3"] {
+            doc.datasets.push(Dataset::new(d));
+        }
+        doc.jobs.push(job("dag", "t1", &["a"], &["b"]));
+        doc.jobs.push(job("dag", "t2", &["b"], &["c"]));
+        // Two declared task edges.
+        doc.edges.push(edge("a", "b", "dag.t1", false));
+        doc.edges.push(edge("b", "c", "dag.t2", false));
+        // Three column-discovery edges carrying 4 + 5 + 6 = 15 mappings.
+        doc.edges.push(column_edge("a", "cd1", 4));
+        doc.edges.push(column_edge("b", "cd2", 5));
+        doc.edges.push(column_edge("c", "cd3", 6));
+
+        let m = compute_gate_metrics(&doc);
+        // Task-edge dimension excludes the column-discovery hops entirely.
+        assert_eq!(m.edges_total, 2, "only the two declared task edges");
+        assert_eq!(m.high_confidence_edges, 2);
+        assert_eq!(
+            m.high_confidence_fraction, 1.0,
+            "column discovery must not poison the task confidence ratio"
+        );
+        // Column dimension reported separately.
+        assert_eq!(m.column_edges, 3);
+        assert_eq!(m.column_mappings, 15);
+
+        // Per-DAG carries the same split (column edges are job-less → "default").
+        let dag = m.per_dag.iter().find(|d| d.dag == "dag").unwrap();
+        assert_eq!((dag.edges_total, dag.high_confidence_edges), (2, 2));
+        assert_eq!(dag.high_confidence_fraction, 1.0);
+        let def = m.per_dag.iter().find(|d| d.dag == "default").unwrap();
+        assert_eq!((def.column_edges, def.column_mappings), (3, 15));
     }
 
     #[test]

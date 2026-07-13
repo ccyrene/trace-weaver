@@ -409,7 +409,21 @@ pub struct Edge {
     pub transform: Transform,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub column_lineage: Vec<ColumnEdge>,
+    /// True when this edge was produced by the column-discovery pass (Pass C):
+    /// an inferred, job-less hop that recovers column lineage from a library
+    /// call (pandas / boto3 / SQLAlchemy / `spark.sql`). These edges live in a
+    /// *different measurement dimension* than task/declared lineage — the gate
+    /// reports them separately (`column_edges` / `column_mappings`) and excludes
+    /// them from `edges_total` / `high_confidence_fraction` so column discovery
+    /// never dilutes the task-scope confidence ratio.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub column_discovery: bool,
     pub origin: Origin,
+}
+
+/// serde `skip_serializing_if` predicate: keep `false` bools out of the JSON.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Edge {
@@ -420,6 +434,7 @@ impl Edge {
             job: None,
             transform: Transform::default(),
             column_lineage: Vec::new(),
+            column_discovery: false,
             origin: Origin::declared(),
         }
     }

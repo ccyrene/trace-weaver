@@ -3,6 +3,51 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
+## 0.5.1
+
+### Fixed
+
+- **Gate metric separation: column-discovery edges no longer poison the task
+  confidence ratio.** v0.5's column-discovery pass (Pass C) folded every
+  inferred, job-less column-lineage hop into the gate's `edges_total` /
+  `high_confidence_edges`. On a real repo this added 121 inferred edges beside
+  the 29 declared task edges, collapsing `high_confidence_fraction` from
+  `1.0` (29/29) to `0.193` (29/150) and tripping a CI gate at
+  `--min-high-confidence 0.30` — even though nothing about the *declared*
+  lineage had changed. Column-discovery edges now carry an explicit
+  `column_discovery` marker in the weave model and are measured in their own
+  dimension: the gate reports them as **report-only** `column_edges` /
+  `column_mappings` (with per-DAG equivalents) and excludes them from
+  `edges_total`, `high_confidence_edges` and `high_confidence_fraction`. Those
+  three remain pure task/declared-scope metrics. This is the same separation the
+  v0.3 annotation split established — discovery in one dimension must never
+  dilute another dimension's ratio. No new thresholds were added.
+
+### Added
+
+- **`MERGE INTO` column lineage (Spark / Iceberg / Delta upserts).** SQL column
+  extraction previously handled only `INSERT` and bare `SELECT`. It now maps a
+  `MERGE INTO target USING source ON … WHEN MATCHED THEN UPDATE SET c = expr …
+  WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs)` statement, recovering both
+  the `UPDATE SET` assignment flows and the positional `INSERT … VALUES` flows
+  (deduplicated per target column, keeping the UPDATE mapping). Source-side
+  references qualified with the source relation's alias (e.g. `source.c`) are
+  de-qualified so single-source resolution attaches them to the real input.
+  This recovers lineage from the common Iceberg composite-key upsert shape and
+  fixes the one central-extract module (`moe_ops/student_information.py`) that
+  previously yielded zero column mappings.
+
+### Known limitations
+
+- **Multi-branch column over-generation (targeted for v0.6).** When a
+  column-discovery function fans a single dataset→dataset edge out across many
+  output branches, the analyzer can attach an inflated column-mapping set to
+  that edge (observed on the order of ~1000 mappings per edge on some central
+  modules). This does not affect the gate's task/declared metrics — such edges
+  are counted only in the report-only `column_mappings` dimension — but it
+  inflates that count and downstream column-lineage exports. A precise
+  per-branch attribution fix is deferred to v0.6.
+
 ## 0.5.0
 
 ### Added
