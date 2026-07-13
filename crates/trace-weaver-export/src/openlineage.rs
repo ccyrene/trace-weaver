@@ -230,4 +230,25 @@ mod tests {
         assert!(report.artifact.contains("\"COMPLETE\""));
         assert!(report.sent >= 1);
     }
+
+    #[test]
+    fn ol_emits_valid_event_for_self_edge() {
+        // A self-edge job lists the same dataset as both an input and an output.
+        // The emitted event must be valid JSON with that dataset on both sides and
+        // a columnLineage facet on the output.
+        let doc = crate::test_support::self_loop_doc();
+        let report = export(&doc, &ExportConfig::default()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&report.artifact).expect("valid OpenLineage JSON");
+        let event = &v[0];
+        let name = "Test Database.poc_db.public.orphans";
+        assert_eq!(event["inputs"][0]["name"], name);
+        assert_eq!(event["outputs"][0]["name"], name);
+        assert!(
+            event["outputs"][0]["facets"]["columnLineage"].is_object(),
+            "self-edge column lineage should be present: {}",
+            report.artifact
+        );
+        assert_eq!(report.sent, 1);
+    }
 }

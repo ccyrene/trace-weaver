@@ -186,4 +186,39 @@ pub(crate) mod test_support {
 
         doc
     }
+
+    /// A one-dataset document with a DECLARED self-edge (X → X) — a hand-authored
+    /// "read prefix X and delete orphans in X" loop. Used to prove every exporter
+    /// emits valid output for a self-edge (it must never crash or malform).
+    pub(crate) fn self_loop_doc() -> WeaveDocument {
+        let mut doc = WeaveDocument::new("example.dwh", "trace-weaver/test");
+
+        let name = "Test Database.poc_db.public.orphans";
+        let mut ds = Dataset::new(name);
+        ds.platform = Some("postgres".into());
+        ds.fqn = FqnParts::parse(name);
+        doc.upsert_dataset(ds);
+
+        let mut job = Job::new("maintenance.dedupe", "dedupe", Engine::Python);
+        job.inputs = vec![name.into()];
+        job.outputs = vec![name.into()];
+        doc.jobs.push(job);
+
+        let mut edge = Edge::new(name, name);
+        edge.job = Some("maintenance.dedupe".into());
+        edge.transform = Transform {
+            kind: Some("DEDUPE".into()),
+            description: Some("delete orphaned rows in place".into()),
+            sql: None,
+        };
+        // A same-dataset column mapping (id → id) exercises the column path too.
+        let mut ce = ColumnEdge::new(vec![ColumnRef::new(name, "id")], ColumnRef::new(name, "id"));
+        ce.function = Some("keep latest".into());
+        ce.transform_type = TransformType::Identity;
+        ce.origin = Origin::declared();
+        edge.column_lineage = vec![ce];
+        doc.edges.push(edge);
+
+        doc
+    }
 }

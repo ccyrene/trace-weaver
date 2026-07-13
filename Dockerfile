@@ -9,8 +9,8 @@
 # Build context is the repository root. Example DAGs are intentionally NOT baked
 # in: at runtime the user mounts their own DAGs as a volume under /work.
 #
-#   docker build -t trace-weaver:0.2.0 .
-#   docker run --rm -v "$PWD/dags:/work/dags" trace-weaver:0.2.0 scan dags -o /work/out.weave.json
+#   docker build -t trace-weaver:0.3.0 .
+#   docker run --rm -v "$PWD/dags:/work/dags" trace-weaver:0.3.0 scan dags -o /work/out.weave.json
 
 # ---------------------------------------------------------------------------
 # Stage 1: builder
@@ -64,7 +64,7 @@ LABEL org.opencontainers.image.title="trace-weaver" \
       org.opencontainers.image.description="trace-weaver data-lineage compiler: scans annotated Python Airflow DAGs into the weave universal JSON format and exports to OpenMetadata / OpenLineage / DOT." \
       org.opencontainers.image.source="https://github.com/ccyrene/trace-weaver" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.version="0.2.0"
+      org.opencontainers.image.version="0.3.0"
 
 ENTRYPOINT ["trace-weaver"]
 CMD ["--help"]

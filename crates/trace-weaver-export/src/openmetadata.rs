@@ -388,4 +388,21 @@ mod tests {
     fn percent_encode_handles_spaces_and_dots() {
         assert_eq!(percent_encode("Test Database.poc"), "Test%20Database.poc");
     }
+
+    #[test]
+    fn om_dry_run_emits_valid_body_for_self_edge() {
+        // A self-edge produces a well-formed request body whose from/to entities
+        // are the same FQN — valid JSON, no crash, one edge.
+        let doc = crate::test_support::self_loop_doc();
+        let report = export(&doc, &ExportConfig::default()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&report.artifact).expect("valid OpenMetadata JSON");
+        assert_eq!(v.as_array().map(|a| a.len()), Some(1));
+        let fqn = "Test Database.poc_db.public.orphans";
+        assert_eq!(v[0]["edge"]["fromEntity"]["fullyQualifiedName"], fqn);
+        assert_eq!(v[0]["edge"]["toEntity"]["fullyQualifiedName"], fqn);
+        // The same-dataset column mapping is carried on the edge.
+        let cols = &v[0]["edge"]["lineageDetails"]["columnsLineage"];
+        assert!(cols.is_array() && !cols.as_array().unwrap().is_empty());
+    }
 }

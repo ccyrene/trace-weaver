@@ -115,4 +115,19 @@ mod tests {
         assert!(report.artifact.contains("bronze_sales"));
         assert!(report.actions[0].contains("nodes"));
     }
+
+    #[test]
+    fn dot_renders_self_edge() {
+        // A self-edge must render as a valid Graphviz `"X" -> "X"` line (Graphviz
+        // draws these as self-loops) — no panic, one edge.
+        let doc = crate::test_support::self_loop_doc();
+        let report = export(&doc, &ExportConfig::default()).unwrap();
+        let node = "\"Test Database.poc_db.public.orphans\"";
+        assert!(
+            report.artifact.contains(&format!("{node} -> {node}")),
+            "expected a self-edge line, got:\n{}",
+            report.artifact
+        );
+        assert!(report.actions[0].contains("1 edges"));
+    }
 }

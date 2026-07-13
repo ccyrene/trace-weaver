@@ -34,6 +34,46 @@ def build_silver():
     dir
 }
 
+/// A repo that reproduces the production "honest annotation" finding: four tasks
+/// where every human-authored task carries an explicit `@lineage`, yet only two
+/// yield a full input→output edge. So annotation_coverage (3/4) is high while
+/// task_coverage (2/4) is lower — and one task (a raw operator) is undecoratable.
+///
+///  * `bare_marker`        — bare `@lineage`               → annotated, no edge
+///  * `probe_inputs_only`  — `@lineage(inputs=[...])`      → annotated, no edge
+///  * `full_task`          — `@lineage(inputs, outputs)`   → annotated, one edge
+///  * `raw_op`             — plain SQL Airflow operator     → NOT annotated, edge
+fn mixed_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("tw-gate-mix-{}-{}", std::process::id(), tag));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("dag.py"),
+        r#"
+from traceweaver import lineage
+from airflow import DAG
+
+@lineage
+def bare_marker():
+    pass
+
+@lineage(inputs=["s3://raw/probe.parquet"])
+def probe_inputs_only():
+    pass
+
+@lineage(inputs=["s3://raw/in.parquet"], outputs=["iceberg://w.db.out"])
+def full_task():
+    pass
+
+RAW_SQL = "INSERT INTO raw_out (id) SELECT id FROM raw_in"
+with DAG("d") as dag:
+    raw = PostgresOperator(task_id="raw_op", sql=RAW_SQL)
+"#,
+    )
+    .unwrap();
+    dir
+}
+
 fn run(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(bin());
     cmd.args(args);
@@ -41,6 +81,7 @@ fn run(args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
     // environment can't perturb the test.
     cmd.env_remove("TRACEWEAVER_MIN_TASK_COVERAGE");
     cmd.env_remove("TRACEWEAVER_MIN_HIGH_CONFIDENCE");
+    cmd.env_remove("TRACEWEAVER_MIN_ANNOTATION_COVERAGE");
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -160,6 +201,116 @@ fn gate_json_has_metrics_and_per_dag() {
     assert_eq!(v["high_confidence_fraction"], 1.0);
     assert_eq!(v["passed"], true);
     assert!(v["per_dag"].is_array());
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn gate_json_reports_annotation_coverage() {
+    // The mixed repo: annotation_coverage = 3/4, task_coverage = 2/4, and the
+    // raw-operator task is counted in tasks_total but is not annotated.
+    let repo = mixed_repo("json-ann");
+    let o = run(
+        &[
+            "gate",
+            "--repo-path",
+            repo.to_str().unwrap(),
+            "--format",
+            "json",
+        ],
+        &[],
+    );
+    assert_eq!(
+        code(&o),
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("valid JSON");
+    assert_eq!(v["tasks_total"], 4);
+    assert_eq!(v["tasks_annotated"], 3);
+    assert_eq!(v["annotation_coverage"], 0.75);
+    assert_eq!(v["task_coverage"], 0.5);
+    assert_eq!(v["thresholds"]["min_annotation_coverage"], 0.0);
+    assert_eq!(v["checks"]["annotation_coverage"], true);
+    // Per-DAG breakdown carries the annotation fields too.
+    assert!(v["per_dag"][0]["annotation_coverage"].is_number());
+    assert_eq!(v["per_dag"][0]["tasks_annotated"], 3);
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn gate_annotation_flag_gates_and_text_shows_line() {
+    let repo = mixed_repo("ann-flag");
+
+    // annotation_coverage is 0.75, so a 0.8 minimum FAILS (exit 1)...
+    let o = run(
+        &[
+            "gate",
+            "--repo-path",
+            repo.to_str().unwrap(),
+            "--min-annotation-coverage",
+            "0.8",
+        ],
+        &[],
+    );
+    assert_eq!(code(&o), 1, "0.8 annotation min should fail on 0.75");
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("annotation_coverage"),
+        "text metric line: {out}"
+    );
+    assert!(out.contains("gate: FAIL"));
+
+    // ...while a 0.75 minimum PASSES (exit 0).
+    let o = run(
+        &[
+            "gate",
+            "--repo-path",
+            repo.to_str().unwrap(),
+            "--min-annotation-coverage",
+            "0.75",
+        ],
+        &[],
+    );
+    assert_eq!(
+        code(&o),
+        0,
+        "0.75 annotation min should pass; stderr: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    let _ = fs::remove_dir_all(&repo);
+}
+
+#[test]
+fn gate_annotation_env_fallback_and_flag_overrides() {
+    let repo = mixed_repo("ann-env");
+
+    // Env alone sets an impossible annotation coverage -> fail (exit 1).
+    let o = run(
+        &["gate", "--repo-path", repo.to_str().unwrap()],
+        &[("TRACEWEAVER_MIN_ANNOTATION_COVERAGE", "0.9")],
+    );
+    assert_eq!(code(&o), 1, "env annotation threshold should gate");
+
+    // A permissive flag overrides the impossible env -> pass (exit 0).
+    let o = run(
+        &[
+            "gate",
+            "--repo-path",
+            repo.to_str().unwrap(),
+            "--min-annotation-coverage",
+            "0.0",
+        ],
+        &[("TRACEWEAVER_MIN_ANNOTATION_COVERAGE", "0.9")],
+    );
+    assert_eq!(code(&o), 0, "flag must win over env");
+
+    // A present-but-unparseable env is a usage error (exit 2).
+    let o = run(
+        &["gate", "--repo-path", repo.to_str().unwrap()],
+        &[("TRACEWEAVER_MIN_ANNOTATION_COVERAGE", "not-a-number")],
+    );
+    assert_eq!(code(&o), 2);
     let _ = fs::remove_dir_all(&repo);
 }
 

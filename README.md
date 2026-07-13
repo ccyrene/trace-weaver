@@ -152,7 +152,7 @@ trace-weaver export --to <openmetadata|openlineage|dot> <doc.weave.json>
 trace-weaver graph <doc.weave.json> [-o out.dot]      # shortcut for export --to dot
 trace-weaver gate --repo-path P [--git-ref R]
                   [--min-task-coverage F] [--min-high-confidence F]
-                  [--format text|json]
+                  [--min-annotation-coverage F] [--format text|json]
 ```
 
 - **`scan`** walks a file or directory of `.py` DAGs and writes the weave IR.
@@ -185,25 +185,52 @@ trace-weaver gate --repo-path P [--git-ref R]
 
 `trace-weaver gate` turns a scan into a pass/fail check so a PR can be blocked when
 lineage regresses. It scans `--repo-path` (optionally as of `--git-ref`) and
-compares two metrics against thresholds:
+compares three metrics against thresholds:
 
 - **`task_coverage`** — fraction of tasks (jobs) that carry at least one lineage
-  edge.
+  edge. A declared self-loop (`input == output`) is a real edge and counts here.
+- **`annotation_coverage`** — fraction of tasks that carry an explicit
+  trace-weaver decorator (`@tw.task` / `@tw.sql` / `@lineage`, **bare or
+  called**), i.e. `tasks_annotated / tasks_total`. A bare `@lineage` marker or
+  an inputs-only declaration is annotated even though it yields no edge.
 - **`high_confidence_fraction`** — fraction of edges that are **declared**
   (high confidence) rather than inferred from SQL/code or reconstructed from a
   non-literal `@lineage` dataset.
 
+The `tasks_total` denominator counts **every** task, including Pass-B tasks the
+scanner discovers decorator-free from raw Airflow operators. Those cannot carry
+a decorator, so they can never be "annotated" and intentionally keep
+`annotation_coverage` below 1.0 — surfacing exactly the un-reviewed surface a
+human still owes an annotation.
+
 ```bash
-# Fail the build if fewer than 80% of tasks have lineage, or under 50% of
-# edges are declared. The JSON format adds a per-DAG breakdown.
-trace-weaver gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
+# Fail the build if fewer than 80% of tasks have lineage, under 90% of tasks are
+# annotated, or under 50% of edges are declared. The JSON format adds a per-DAG
+# breakdown (with the annotation fields on each DAG too).
+trace-weaver gate --repo-path dags \
+  --min-task-coverage 0.8 --min-annotation-coverage 0.9 --min-high-confidence 0.5
 trace-weaver gate --repo-path dags --format json
 ```
 
-Thresholds may also come from the environment — `TRACEWEAVER_MIN_TASK_COVERAGE`
-and `TRACEWEAVER_MIN_HIGH_CONFIDENCE` — and an explicit flag always wins over the
-env var. **Exit codes:** `0` pass, `1` a threshold failed (the failing metric is
-printed), `2` usage error (bad path, unparseable threshold, invalid `--format`).
+**Which metric to use when.** They measure different things and are best gated
+**together**:
+
+- **`task_coverage` = data-flow completeness** — of the tasks that exist, how
+  many actually resolve to a lineage edge. Use it to guarantee the graph is
+  connected.
+- **`annotation_coverage` = review completeness** — how much of the pipeline a
+  human has explicitly marked, regardless of whether that mark produced a full
+  edge. Use it to guarantee humans have looked at every task. It is the honest
+  companion to `task_coverage`: annotating a task truthfully (a bare marker, or
+  an inputs-only declaration for a sink whose output you can't name) raises
+  `annotation_coverage` even when it can't raise `task_coverage`, so gating on
+  annotation never punishes honest, single-sided declarations.
+
+Thresholds may also come from the environment — `TRACEWEAVER_MIN_TASK_COVERAGE`,
+`TRACEWEAVER_MIN_ANNOTATION_COVERAGE`, and `TRACEWEAVER_MIN_HIGH_CONFIDENCE` —
+and an explicit flag always wins over the env var. **Exit codes:** `0` pass, `1`
+a threshold failed (the failing metric is printed), `2` usage error (bad path,
+unparseable threshold, invalid `--format`).
 
 #### Running `gate` in CI
 
@@ -214,7 +241,7 @@ permission juggling needed (contrast `scan -o`, which writes into the mount
 and does need it — see [Running via Docker](#running-via-docker)):
 
 ```bash
-docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.3.0 \
   gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
@@ -230,7 +257,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: trace-weaver lineage gate
         run: |
-          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.2.0 \
+          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.3.0 \
             gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
@@ -251,12 +278,12 @@ pipelines:
           services:
             - docker
           script:
-            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.2.0
+            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.3.0
                 gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
 Swap `<dockerhub-namespace>` for the `DOCKERHUB_USERNAME` the image was
-published under, and pin to a release tag (`:0.2.0`) rather than `:latest` for
+published under, and pin to a release tag (`:0.3.0`) rather than `:latest` for
 a reproducible gate.
 
 ---
@@ -404,23 +431,23 @@ binary + CA roots, running as a fixed non-root `traceweaver` user (uid/gid
 CLI subcommand is just appended as `docker run` arguments:
 
 ```bash
-docker build -t trace-weaver:0.2.0 .
+docker build -t trace-weaver:0.3.0 .
 
 # Read-only commands (gate, validate, export --dry-run): bind-mount the repo
 # at /work — no special permissions needed since nothing is written back.
-docker run --rm -v "$PWD:/work" trace-weaver:0.2.0 \
+docker run --rm -v "$PWD:/work" trace-weaver:0.3.0 \
   gate --repo-path examples/sample_dags --min-task-coverage 0.5
 
 # Commands that write into the mount (scan -o, export -o, graph -o): pass
 # --user "$(id -u):$(id -g)" so the container writes as YOUR uid, not the
 # image's fixed uid 10001 (which the bind-mounted host directory doesn't
 # grant write access to).
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.2.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.3.0 \
   scan examples/sample_dags -o /work/out.weave.json
 ```
 
-Once an image is published (below), swap the locally-built `trace-weaver:0.2.0`
-tag for `<dockerhub-namespace>/trace-weaver:0.2.0`.
+Once an image is published (below), swap the locally-built `trace-weaver:0.3.0`
+tag for `<dockerhub-namespace>/trace-weaver:0.3.0`.
 
 ## Publishing (Docker Hub)
 

@@ -25,7 +25,15 @@ impl WeaveDocument {
         for job in &self.jobs {
             for from in &job.inputs {
                 for to in &job.outputs {
-                    if from == to {
+                    // A self-loop (from == to) is normally noise and is skipped —
+                    // *unless* it comes from an explicit, hand-declared job (a
+                    // `@lineage`/`@tw` task whose origin is `Declared`). A declared
+                    // self-loop is a legitimate fact ("read prefix X and delete
+                    // orphans in X"), so we emit it as a self-edge. Self-loops on
+                    // an inferred (Pass-B, decorator-free discovered) job stay
+                    // skipped, since a machine-inferred read-your-own-write pair is
+                    // far more likely to be noise than intent.
+                    if from == to && job.origin.is_inferred() {
                         continue;
                     }
                     let key = (from.clone(), to.clone());
@@ -135,5 +143,77 @@ pub fn merge_origin(a: Origin, b: Origin) -> Origin {
                 a
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::model::{Dataset, Engine, Job, WeaveDocument};
+    use crate::origin::Origin;
+
+    fn job_with_origin(id: &str, input: &str, output: &str, origin: Origin) -> Job {
+        let mut j = Job::new(id, id, Engine::Python);
+        j.inputs = vec![input.to_string()];
+        j.outputs = vec![output.to_string()];
+        j.origin = origin;
+        j
+    }
+
+    #[test]
+    fn declared_self_loop_yields_a_self_edge() {
+        // A hand-declared job whose only input == its only output ("read prefix X,
+        // delete orphans in X") must produce a self-edge X -> X, not be skipped.
+        let mut doc = WeaveDocument::new("ns", "test");
+        doc.datasets.push(Dataset::new("s3://bucket/prefix"));
+        doc.jobs.push(job_with_origin(
+            "dag.dedupe",
+            "s3://bucket/prefix",
+            "s3://bucket/prefix",
+            Origin::declared(),
+        ));
+
+        assert_eq!(doc.derive_edges_from_jobs(), 1);
+        assert_eq!(doc.edges.len(), 1);
+        let e = &doc.edges[0];
+        assert_eq!(e.from, "s3://bucket/prefix");
+        assert_eq!(e.to, "s3://bucket/prefix");
+        assert!(!e.origin.is_inferred(), "declared self-edge stays declared");
+
+        // Deriving again is idempotent: the existing self-edge is not duplicated.
+        assert_eq!(doc.derive_edges_from_jobs(), 0);
+        assert_eq!(doc.edges.len(), 1);
+    }
+
+    #[test]
+    fn inferred_self_loop_is_still_skipped() {
+        // A decorator-free (Pass-B, inferred) job with input == output is far more
+        // likely noise than intent, so its self-loop stays skipped.
+        let mut doc = WeaveDocument::new("ns", "test");
+        doc.datasets.push(Dataset::new("t"));
+        doc.jobs.push(job_with_origin(
+            "dag.discovered",
+            "t",
+            "t",
+            Origin::inferred_code(0.6),
+        ));
+
+        assert_eq!(doc.derive_edges_from_jobs(), 0);
+        assert!(doc.edges.is_empty());
+    }
+
+    #[test]
+    fn self_loop_topo_order_does_not_panic() {
+        // A self-edge participates in a trivial cycle; topological ordering must
+        // still terminate and produce a total order (regression guard).
+        let mut doc = WeaveDocument::new("ns", "test");
+        doc.datasets.push(Dataset::new("x"));
+        doc.datasets.push(Dataset::new("y"));
+        doc.jobs
+            .push(job_with_origin("dag.self", "x", "x", Origin::declared()));
+        doc.jobs
+            .push(job_with_origin("dag.fwd", "x", "y", Origin::declared()));
+        doc.derive_edges_from_jobs();
+        let order = doc.edges_in_topo_order();
+        assert_eq!(order.len(), 2);
     }
 }
