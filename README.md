@@ -241,7 +241,7 @@ permission juggling needed (contrast `scan -o`, which writes into the mount
 and does need it — see [Running via Docker](#running-via-docker)):
 
 ```bash
-docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.3.0 \
+docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.4.0 \
   gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
@@ -257,7 +257,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: trace-weaver lineage gate
         run: |
-          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.3.0 \
+          docker run --rm -v "$PWD:/work" <dockerhub-namespace>/trace-weaver:0.4.0 \
             gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
@@ -278,12 +278,12 @@ pipelines:
           services:
             - docker
           script:
-            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.3.0
+            - docker run --rm -v "$BITBUCKET_CLONE_DIR:/work" <dockerhub-namespace>/trace-weaver:0.4.0
                 gate --repo-path dags --min-task-coverage 0.8 --min-high-confidence 0.5
 ```
 
 Swap `<dockerhub-namespace>` for the `DOCKERHUB_USERNAME` the image was
-published under, and pin to a release tag (`:0.3.0`) rather than `:latest` for
+published under, and pin to a release tag (`:0.4.0`) rather than `:latest` for
 a reproducible gate.
 
 ---
@@ -322,9 +322,52 @@ def touch():
   `import trace_weaver as tw` + `@tw.lineage`. It also works **stacked with
   Airflow's `@task`** in any order.
 - **Confidence:** a string-literal dataset is **declared / high confidence**; a
-  non-literal entry (an f-string, a variable, a call) is kept as a best-effort
-  textual representation and marked **medium confidence** (inferred) so the gate
-  and exporters can tell it apart.
+  non-literal entry (an f-string, an arbitrary call, a subscript) is kept as a
+  best-effort textual representation and marked **medium confidence** (inferred)
+  so the gate and exporters can tell it apart.
+
+### URIs may live in a shared constants module
+
+You don't have to inline the URI string. A dataset entry may reference a
+**module-level string constant** — locally or imported from another file — and
+it still resolves to **declared / high confidence**. This lets a team centralize
+its dataset URIs in one place (e.g. `config/datasets.py`) and reference them by
+name everywhere:
+
+```python
+# config/datasets.py
+RAW_SALES    = "s3://acme-raw/sales/events.parquet"
+BRONZE_SALES = "iceberg://warehouse.sales.bronze"
+
+# services/ingest.py
+from trace_weaver import lineage
+from config.datasets import RAW_SALES, BRONZE_SALES
+
+@lineage(inputs=[RAW_SALES], outputs=[BRONZE_SALES])   # still declared / HIGH
+def ingest_sales():
+    ...
+```
+
+The scanner builds a repo-wide table of module-level constants before scanning
+(keyed by the dotted module path a file imports under — `config/datasets.py` →
+`config.datasets`), so a constant defined in any scanned file resolves. The same
+resolution applies to `@tw.task` / `@tw.sql` `inputs=`/`outputs=`.
+
+**Supported reference forms** (each resolves to declared / HIGH):
+
+| Form                                             | Example                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------- |
+| Bare name, same module                           | `RAW = "s3://…"` then `inputs=[RAW]`                           |
+| One-level alias, same module                     | `RAW = BASE` (chained, cycle-guarded) then `inputs=[RAW]`     |
+| `from pkg.mod import NAME`                        | `from config.datasets import RAW_SALES` then `inputs=[RAW_SALES]` |
+| `from pkg.mod import NAME as ALIAS`              | `from config.datasets import RAW_SALES as RAW` then `inputs=[RAW]` |
+| `import pkg.mod as m` + attribute               | `import config.datasets as ds` then `inputs=[ds.RAW_SALES]`   |
+| `import pkg.mod` + dotted attribute             | `import config.datasets` then `inputs=[config.datasets.RAW_SALES]` |
+
+**NOT resolved** (kept as best-effort text, marked medium / inferred — never
+guessed): a missing/undefined name, a function call (`make_uri()`), an f-string
+with placeholders (`f"s3://…/{day}"`), a subscript (`CFG["raw"]`), or a value
+that is not a plain string literal.
 
 See [`examples/sample_dags/declared_lineage.py`](examples/sample_dags/declared_lineage.py)
 for a full DAG.
@@ -431,23 +474,23 @@ binary + CA roots, running as a fixed non-root `traceweaver` user (uid/gid
 CLI subcommand is just appended as `docker run` arguments:
 
 ```bash
-docker build -t trace-weaver:0.3.0 .
+docker build -t trace-weaver:0.4.0 .
 
 # Read-only commands (gate, validate, export --dry-run): bind-mount the repo
 # at /work — no special permissions needed since nothing is written back.
-docker run --rm -v "$PWD:/work" trace-weaver:0.3.0 \
+docker run --rm -v "$PWD:/work" trace-weaver:0.4.0 \
   gate --repo-path examples/sample_dags --min-task-coverage 0.5
 
 # Commands that write into the mount (scan -o, export -o, graph -o): pass
 # --user "$(id -u):$(id -g)" so the container writes as YOUR uid, not the
 # image's fixed uid 10001 (which the bind-mounted host directory doesn't
 # grant write access to).
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.3.0 \
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" trace-weaver:0.4.0 \
   scan examples/sample_dags -o /work/out.weave.json
 ```
 
-Once an image is published (below), swap the locally-built `trace-weaver:0.3.0`
-tag for `<dockerhub-namespace>/trace-weaver:0.3.0`.
+Once an image is published (below), swap the locally-built `trace-weaver:0.4.0`
+tag for `<dockerhub-namespace>/trace-weaver:0.4.0`.
 
 ## Publishing (Docker Hub)
 
