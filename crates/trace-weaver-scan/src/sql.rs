@@ -7,8 +7,9 @@
 //! [`trace_weaver_core::OriginSource::InferredSql`].
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    AssignmentTarget, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Merge, MergeAction,
+    MergeInsertKind, ObjectName, ObjectNamePart, Query, Select, SelectItem, SetExpr, Statement,
+    TableFactor, TableObject, TableWithJoins,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -79,6 +80,13 @@ pub fn column_lineage_from_sql(sql: &str) -> anyhow::Result<SqlColumnLineage> {
             Statement::Query(query) => {
                 let lineage = lineage_from_query(query, &[]);
                 return Ok(lineage);
+            }
+            // Spark / Iceberg / Delta `MERGE INTO target USING source ON …`.
+            Statement::Merge(merge) => {
+                let lineage = lineage_from_merge(merge);
+                if lineage.target_table.is_some() {
+                    return Ok(lineage);
+                }
             }
             _ => continue,
         }
@@ -179,6 +187,113 @@ fn lineage_from_query(query: &Query, target_cols: &[String]) -> SqlColumnLineage
         }
     }
     out
+}
+
+/// Build column lineage from a `MERGE INTO target USING source ON … WHEN …`
+/// statement (Spark / Iceberg / Delta upserts).
+///
+/// Two flows contribute a target column. `WHEN MATCHED THEN UPDATE SET
+/// target.c = source.c` maps the assignment RHS onto `c`; `WHEN NOT MATCHED
+/// THEN INSERT (c, …) VALUES (source.c, …)` maps the i-th value expression onto
+/// the i-th insert column (positionally).
+///
+/// Duplicate targets (a column touched by both the UPDATE and the INSERT) are
+/// recorded once, keeping the first (UPDATE) mapping. Source-side column
+/// references qualified with the source table's alias/name are de-qualified so
+/// the caller's single-source resolution can attach them to the real input.
+fn lineage_from_merge(merge: &Merge) -> SqlColumnLineage {
+    let mut out = SqlColumnLineage::default();
+
+    let (target_table, _target_alias) = match table_factor_parts(&merge.table) {
+        Some(p) => p,
+        None => return out, // non-table target (subquery/TVF) — nothing to map
+    };
+    out.target_table = Some(target_table);
+
+    // The source relation and the aliases that name it inside the WHEN clauses.
+    let source = table_factor_parts(&merge.source);
+    if let Some((src_table, _)) = &source {
+        out.source_tables = vec![src_table.clone()];
+    }
+    // Any qualifier equal to the source's alias or its table name refers to the
+    // source relation; strip it so downstream single-source resolution applies.
+    let source_aliases: Vec<String> = source
+        .iter()
+        .flat_map(|(t, a)| a.iter().cloned().chain(std::iter::once(t.clone())))
+        .collect();
+    let dequalify = |mut sources: Vec<SqlColRef>| -> Vec<SqlColRef> {
+        for s in &mut sources {
+            if let Some(t) = &s.table {
+                if source_aliases.iter().any(|a| a == t) {
+                    s.table = None;
+                }
+            }
+        }
+        sources
+    };
+
+    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut push_mapping = |target: String, expr: &Expr, out: &mut SqlColumnLineage| {
+        if target.is_empty() || !seen_targets.insert(target.clone()) {
+            return;
+        }
+        let mut sources = Vec::new();
+        collect_col_refs(expr, &mut sources);
+        out.mappings.push(SqlMapping {
+            sources: dequalify(sources),
+            target,
+            function: render_expr(expr),
+            transform_type: classify_expr(expr),
+        });
+    };
+
+    for clause in &merge.clauses {
+        match &clause.action {
+            // WHEN MATCHED THEN UPDATE SET c = expr, …
+            MergeAction::Update(update) => {
+                for assign in &update.assignments {
+                    let target = match &assign.target {
+                        AssignmentTarget::ColumnName(name) => object_name_last(name),
+                        // A tuple target `(a, b) = (…)` has no single column name
+                        // to attribute; skip rather than guess.
+                        AssignmentTarget::Tuple(_) => continue,
+                    };
+                    push_mapping(target, &assign.value, &mut out);
+                }
+            }
+            // WHEN NOT MATCHED THEN INSERT (cols) VALUES (exprs)
+            MergeAction::Insert(insert) => {
+                if let MergeInsertKind::Values(values) = &insert.kind {
+                    let Some(row) = values.rows.first() else {
+                        continue;
+                    };
+                    let exprs = &row.content;
+                    // Positional mapping is only sound when the arity matches.
+                    if insert.columns.len() != exprs.len() {
+                        continue;
+                    }
+                    for (col, expr) in insert.columns.iter().zip(exprs.iter()) {
+                        push_mapping(object_name_last(col), expr, &mut out);
+                    }
+                }
+            }
+            MergeAction::Delete { .. } => {}
+        }
+    }
+
+    out
+}
+
+/// The last-segment name and optional alias of a simple table `TableFactor`.
+/// Returns `None` for subqueries / table-valued functions.
+fn table_factor_parts(factor: &TableFactor) -> Option<(String, Option<String>)> {
+    match factor {
+        TableFactor::Table { name, alias, .. } => Some((
+            object_name_last(name),
+            alias.as_ref().map(|a| a.name.value.clone()),
+        )),
+        _ => None,
+    }
 }
 
 /// Drill through parenthesised / set-operation bodies to the leading SELECT.
@@ -547,6 +662,73 @@ GROUP BY event_date;
         assert_eq!(lin.target_table.as_deref(), Some("t"));
         assert_eq!(lin.mappings.len(), 1);
         assert_eq!(lin.mappings[0].target, "a");
+    }
+
+    #[test]
+    fn merge_into_maps_update_set_and_insert_flows() {
+        // Spark/Iceberg upsert: WHEN MATCHED updates and WHEN NOT MATCHED inserts
+        // map the same columns; both flows are recovered and the target is
+        // recorded once. Source refs qualified with the `source` alias are
+        // de-qualified so the caller's single-source resolution attaches them.
+        let sql = r#"
+MERGE INTO glue_cat.db.students AS target
+USING staging AS source
+ON target.id IS NOT DISTINCT FROM source.id
+WHEN MATCHED THEN
+    UPDATE SET
+        target.id = source.id,
+        target.name = source.name,
+        target.score = source.raw * 2
+WHEN NOT MATCHED THEN
+    INSERT (id, name, score)
+    VALUES (source.id, source.name, source.raw * 2)
+"#;
+        let lin = column_lineage_from_sql(sql).unwrap();
+        assert_eq!(lin.target_table.as_deref(), Some("students"));
+        assert!(lin.source_tables.contains(&"staging".to_string()));
+        // Three distinct targets — the INSERT does not double-count id/name/score.
+        assert_eq!(lin.mappings.len(), 3);
+
+        let m: std::collections::HashMap<_, _> =
+            lin.mappings.iter().map(|m| (m.target.clone(), m)).collect();
+
+        // id <- source.id, de-qualified to an unqualified column, identity copy.
+        let id = m.get("id").unwrap();
+        assert_eq!(id.transform_type, TransformType::Identity);
+        assert_eq!(
+            id.sources,
+            vec![SqlColRef {
+                table: None,
+                column: "id".into()
+            }]
+        );
+        // score <- source.raw * 2 => a transformation.
+        let score = m.get("score").unwrap();
+        assert_eq!(score.transform_type, TransformType::Transformation);
+        assert_eq!(
+            score.sources,
+            vec![SqlColRef {
+                table: None,
+                column: "raw".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn merge_insert_only_maps_without_update() {
+        // A MERGE whose only mutating clause is the NOT-MATCHED INSERT still maps.
+        let sql = "MERGE INTO t AS tgt USING s AS src ON tgt.k = src.k \
+                   WHEN NOT MATCHED THEN INSERT (a, b) VALUES (src.a, src.b + 1)";
+        let lin = column_lineage_from_sql(sql).unwrap();
+        assert_eq!(lin.target_table.as_deref(), Some("t"));
+        assert_eq!(lin.mappings.len(), 2);
+        assert_eq!(lin.mappings[0].target, "a");
+        assert_eq!(lin.mappings[0].transform_type, TransformType::Identity);
+        assert_eq!(lin.mappings[1].target, "b");
+        assert_eq!(
+            lin.mappings[1].transform_type,
+            TransformType::Transformation
+        );
     }
 
     #[test]

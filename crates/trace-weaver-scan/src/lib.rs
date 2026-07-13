@@ -644,6 +644,9 @@ fn scan_column_discovery(
                 sql: None,
             };
             edge.origin = element_origin.clone();
+            // Mark this as a column-discovery (Pass C) edge so the gate measures
+            // it in the column dimension, not the task/declared edge ratio.
+            edge.column_discovery = true;
             for ce in &col_edges {
                 let attach = !ce.from_columns.is_empty()
                     && ce.from_columns.iter().any(|fc| &fc.dataset == input);

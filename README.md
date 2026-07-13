@@ -216,6 +216,25 @@ a decorator, so they can never be "annotated" and intentionally keep
 `annotation_coverage` below 1.0 — surfacing exactly the un-reviewed surface a
 human still owes an annotation.
 
+**Column-discovery edges are measured separately.** Edges recovered by the
+column-discovery pass (Pass C — inferred, job-less hops that reconstruct
+column lineage from a library call) do **not** enter `edges_total`,
+`high_confidence_edges` or `high_confidence_fraction`; those stay pure
+task/declared-scope metrics. Instead the gate reports two **report-only**
+counters (with per-DAG equivalents in the text and JSON output):
+`column_edges` (how many such edges) and `column_mappings` (the total
+column-level mappings they carry). This keeps a large, entirely-inferred body
+of discovered column lineage from diluting the task confidence ratio a CI gate
+is built on — the same dimensional separation the annotation split introduced.
+
+> **Known limitation (targeted for v0.6).** When a column-discovery function
+> fans one dataset→dataset edge across many output branches, the analyzer can
+> attach an inflated column-mapping set to that edge (order of ~1000 mappings
+> per edge on some modules). It never affects the task/declared gate metrics —
+> the count lands only in the report-only `column_mappings` — but it inflates
+> that number and downstream column-lineage exports. Precise per-branch
+> attribution is deferred to v0.6.
+
 ```bash
 # Fail the build if fewer than 80% of tasks have lineage, under 90% of tasks are
 # annotated, or under 50% of edges are declared. The JSON format adds a per-DAG
