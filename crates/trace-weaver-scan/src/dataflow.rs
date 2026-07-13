@@ -225,9 +225,27 @@ struct Analyzer<'a> {
     row_alias: Option<(String, Option<String>)>,
     /// Source tables read by the body, accumulated from readers (first-seen order).
     inputs: Vec<String>,
+    /// Temp-view name -> the underlying frame's base table, from
+    /// `df.createOrReplaceTempView("v")`. Lets a later `spark.sql("… FROM v")`
+    /// chain back to `df`'s upstream table (or stay the view name when unknown).
+    temp_views: HashMap<String, Option<String>>,
+    /// Output tables named by an `INSERT`/`INSERT OVERWRITE` inside a
+    /// `spark.sql(f"…")` call (folded), which have no frame owner in `writes`.
+    sql_outputs: Vec<String>,
     saw_spark: bool,
     saw_pandas: bool,
 }
+
+/// Placeholder substituted for a genuinely runtime f-string interpolation
+/// (a function parameter like `{full_table_name}`) when folding SQL text, so a
+/// fully-static SELECT/CAST column list still parses. A bare SQL identifier —
+/// table identity ends up template/unknown, which the model already tolerates.
+const SQL_TEMPLATE_PLACEHOLDER: &str = "tw_tmpl";
+
+/// Synthetic column owner for mappings recovered from a `spark.sql(INSERT …)`
+/// call (no frame variable owns them); never present in `writes`, so its
+/// `output_table` survives `finish()`.
+const SQL_STMT_OWNER: &str = "__tw_sql_stmt__";
 
 /// Statically analyse a function `body` for column lineage.
 pub fn analyze(body: &[Stmt], consts: &HashMap<String, String>, source: &str) -> DataflowResult {
@@ -242,6 +260,8 @@ pub fn analyze(body: &[Stmt], consts: &HashMap<String, String>, source: &str) ->
         str_vars: HashMap::new(),
         row_alias: None,
         inputs: Vec::new(),
+        temp_views: HashMap::new(),
+        sql_outputs: Vec::new(),
         saw_spark: false,
         saw_pandas: false,
     };
@@ -280,8 +300,9 @@ impl<'a> Analyzer<'a> {
                 self.assign(&asg.targets[0], &asg.value);
             }
             Stmt::Expr(e) => {
-                // Statement-position call: detect a write (df.to_sql / saveAsTable).
-                self.detect_write(&e.value);
+                // Statement-position call: a temp-view registration, a
+                // `spark.sql(INSERT …)` write, or a df.to_sql / saveAsTable write.
+                self.stmt_call(&e.value);
             }
             Stmt::With(w) => self.block(&w.body),
             Stmt::If(i) => {
@@ -953,6 +974,182 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    /// Dispatch a statement-position call: a temp-view registration
+    /// (`df.createOrReplaceTempView("v")`), a `spark.sql(INSERT …)` write, or a
+    /// classic `df.to_sql(...)` / `df.write.saveAsTable(...)` write.
+    fn stmt_call(&mut self, expr: &Expr) {
+        if let Expr::Call(c) = expr {
+            match callee_final_segment(&c.func).as_deref() {
+                Some(
+                    "createOrReplaceTempView"
+                    | "createOrReplaceGlobalTempView"
+                    | "createTempView"
+                    | "createGlobalTempView"
+                    | "registerTempTable",
+                ) => {
+                    self.register_temp_view(c);
+                    return;
+                }
+                // A bare `spark.sql(f"INSERT …")` — parse the (folded) query for
+                // column lineage. Returns true when handled as a spark.sql call.
+                Some("sql") if self.handle_spark_sql(c) => return,
+                _ => {}
+            }
+        }
+        self.detect_write(expr);
+    }
+
+    /// Record `df.createOrReplaceTempView("v")`: bind view name `v` to the
+    /// receiver frame's base table (unknown when the frame's origin is unknown).
+    fn register_temp_view(&mut self, call: &ast::ExprCall) {
+        let name = match call.args.first().and_then(const_str) {
+            Some(n) => n,
+            None => return,
+        };
+        let recv = match call.func.as_ref() {
+            Expr::Attribute(a) => a.value.as_ref(),
+            _ => return,
+        };
+        let table = innermost_name(recv).and_then(|v| self.frames.get(v).cloned().flatten());
+        self.temp_views.insert(name, table);
+    }
+
+    /// Resolve a SQL source-table reference through the temp-view registry: a
+    /// registered view with a known underlying table folds to that table;
+    /// otherwise (an unknown-origin view, or a real table) the name is kept.
+    fn resolve_view(&self, name: &str) -> String {
+        match self.temp_views.get(name) {
+            Some(Some(t)) => t.clone(),
+            _ => name.to_string(),
+        }
+    }
+
+    /// Resolve a scalar expression to a string: a literal, the active unrolled
+    /// loop variable, a local string var (`col = "x"`), or a module constant.
+    fn resolve_scalar(&self, expr: &Expr) -> Option<String> {
+        if let Some(s) = const_str(expr) {
+            return Some(s);
+        }
+        if let Expr::Name(n) = expr {
+            if let Some((var, val)) = &self.loop_subst {
+                if n.id.as_str() == var {
+                    return Some(val.clone());
+                }
+            }
+            if let Some(s) = self.str_vars.get(n.id.as_str()) {
+                return Some(s.clone());
+            }
+            if let Some(s) = self.consts.get(n.id.as_str()) {
+                return Some(s.clone());
+            }
+        }
+        None
+    }
+
+    /// Resolve a (possibly f-string) SQL argument to text. Literal segments and
+    /// v0.4-resolvable interpolations (`{NAME}` where NAME is a module constant
+    /// or a local string var) fold to their value; genuinely runtime
+    /// interpolations (function params like `{full_table_name}`) fold to a
+    /// stable placeholder identifier so the fully-static SELECT/CAST column list
+    /// still parses. Returns `None` for non-string expressions.
+    fn resolve_sql_text(&self, expr: &Expr) -> Option<String> {
+        if let Some(s) = self.resolve_scalar(expr) {
+            return Some(s);
+        }
+        let ast::Expr::JoinedStr(js) = expr else {
+            return None;
+        };
+        let mut out = String::new();
+        for part in &js.values {
+            match part {
+                Expr::Constant(c) => {
+                    if let ast::Constant::Str(s) = &c.value {
+                        out.push_str(s);
+                    }
+                }
+                Expr::FormattedValue(fv) => match self.resolve_scalar(&fv.value) {
+                    Some(s) => out.push_str(&s),
+                    None => out.push_str(SQL_TEMPLATE_PLACEHOLDER),
+                },
+                other => match self.resolve_scalar(other) {
+                    Some(s) => out.push_str(&s),
+                    None => out.push_str(SQL_TEMPLATE_PLACEHOLDER),
+                },
+            }
+        }
+        Some(out)
+    }
+
+    /// Handle a `spark.sql(<query>)` call. Returns `true` when the call was a
+    /// recognised `.sql(...)` (so the dispatcher stops). Only an
+    /// `INSERT`/`INSERT OVERWRITE` (which names a target table) produces column
+    /// lineage; a bare `SELECT`/DDL is accepted-and-ignored (still `true`).
+    fn handle_spark_sql(&mut self, call: &ast::ExprCall) -> bool {
+        if callee_final_segment(&call.func).as_deref() != Some("sql") {
+            return false;
+        }
+        let arg = match call.args.first() {
+            Some(a) => a,
+            None => return false,
+        };
+        let text = match self.resolve_sql_text(arg) {
+            Some(t) => t,
+            None => return false,
+        };
+        let lineage = match crate::sql::column_lineage_from_sql(&text) {
+            Ok(l) => l,
+            Err(_) => return true,
+        };
+        let target = match &lineage.target_table {
+            Some(t) => t.clone(),
+            None => return true, // SELECT / DDL — nothing written
+        };
+        self.saw_spark = true;
+
+        // Resolve FROM tables through the temp-view registry and record inputs.
+        for src in &lineage.source_tables {
+            let resolved = self.resolve_view(src);
+            if !self.inputs.contains(&resolved) {
+                self.inputs.push(resolved);
+            }
+        }
+        // With exactly one source, bare (unqualified) SELECT columns belong to it.
+        let default_src = if lineage.source_tables.len() == 1 {
+            Some(self.resolve_view(&lineage.source_tables[0]))
+        } else {
+            None
+        };
+
+        for m in &lineage.mappings {
+            let sources: Vec<String> = m
+                .sources
+                .iter()
+                .map(|s| {
+                    let table = s.table.clone().or_else(|| default_src.clone());
+                    ColRef {
+                        table,
+                        column: s.column.clone(),
+                    }
+                    .render()
+                })
+                .collect();
+            self.columns.push((
+                SQL_STMT_OWNER.to_string(),
+                InferredColumn {
+                    sources,
+                    target: m.target.clone(),
+                    function: Some(m.function.clone()),
+                    transform_type: m.transform_type,
+                    output_table: Some(target.clone()),
+                },
+            ));
+        }
+        if !self.sql_outputs.contains(&target) {
+            self.sql_outputs.push(target);
+        }
+        true
+    }
+
     /// Collect column references inside an expression.
     fn collect_cols(&self, expr: &Expr, out: &mut Vec<ColRef>) {
         match expr {
@@ -1093,12 +1290,15 @@ impl<'a> Analyzer<'a> {
             columns,
             opaque,
             inputs,
+            sql_outputs,
             saw_spark,
             saw_pandas,
             ..
         } = self;
-        // outputs = distinct tables written (sorted for a deterministic document).
+        // outputs = distinct tables written, from frame writes (to_sql/saveAsTable)
+        // AND from `spark.sql(INSERT …)` targets. Sorted for a deterministic doc.
         let mut outputs: Vec<String> = writes.values().flatten().cloned().collect();
+        outputs.extend(sql_outputs);
         outputs.sort();
         outputs.dedup();
         let cols = columns
@@ -1575,5 +1775,94 @@ def f():
             "df.columns= must be flagged: {:?}",
             r
         );
+    }
+
+    #[test]
+    fn fstring_spark_sql_insert_folds_and_maps() {
+        // The DII transform shape: a path read bound to a temp view, then an
+        // f-string spark.sql INSERT whose ONLY dynamic part is the target table.
+        // The fully-static SELECT/CAST list must still parse and map, and FROM
+        // the temp view resolves the source dataset.
+        let src = r#"
+def run(spark, src_path, database, table):
+    df = spark.read.format("parquet").load(src_path)
+    df.createOrReplaceTempView("raw_staging")
+    full_table_name = f"glue_cat.{database}.{table}"
+    spark.sql(f"""
+        INSERT INTO {full_table_name}
+        SELECT CAST(`HOSPCODE` AS STRING), CAST(`SEQ` AS INT), `WEIGHT`
+        FROM raw_staging
+    """)
+"#;
+        let r = run(src);
+        assert_eq!(r.engine.as_deref(), Some("spark"));
+        // Source is the temp view (whose underlying parquet frame is unknown).
+        assert!(
+            r.inputs.contains(&"raw_staging".to_string()),
+            "inputs: {:?}",
+            r.inputs
+        );
+        // Target folded to a placeholder table (runtime {full_table_name}).
+        assert!(
+            r.outputs.iter().any(|o| o == "tw_tmpl"),
+            "outputs: {:?}",
+            r.outputs
+        );
+        let h = col(&r, "HOSPCODE");
+        assert_eq!(h.sources, vec!["raw_staging.HOSPCODE"]);
+        assert_eq!(h.transform_type, TransformType::Transformation); // CAST
+        assert_eq!(h.output_table.as_deref(), Some("tw_tmpl"));
+        // A bare (uncast) column is an identity passthrough.
+        assert_eq!(col(&r, "WEIGHT").transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn temp_view_chains_known_table_into_sql() {
+        // A temp view over a frame whose table IS known (spark.read.table) chains
+        // that table through a subsequent spark.sql referencing the view name.
+        let src = r#"
+def run(spark):
+    b = spark.read.table("bronze")
+    b.createOrReplaceTempView("v")
+    spark.sql("INSERT INTO gold SELECT CAST(`amount` AS INT) FROM v")
+"#;
+        let r = run(src);
+        assert!(r.inputs.contains(&"bronze".to_string()), "{:?}", r.inputs);
+        assert_eq!(col(&r, "amount").sources, vec!["bronze.amount"]);
+        assert_eq!(col(&r, "amount").output_table.as_deref(), Some("gold"));
+    }
+
+    #[test]
+    fn fstring_with_resolvable_const_folds_to_value() {
+        // An interpolation that IS a module constant folds to its literal, so the
+        // real table name (not a placeholder) survives.
+        let mut consts = HashMap::new();
+        consts.insert("TBL".to_string(), "warehouse".to_string());
+        let src = r#"
+def run(spark):
+    df = spark.read.table("src")
+    df.createOrReplaceTempView("src")
+    spark.sql(f"INSERT INTO {TBL} SELECT CAST(`a` AS INT) FROM src")
+"#;
+        let body = body_of(src);
+        let r = analyze(&body, &consts, src);
+        assert!(
+            r.outputs.iter().any(|o| o == "warehouse"),
+            "constant should fold to its literal: {:?}",
+            r.outputs
+        );
+    }
+
+    #[test]
+    fn create_table_fstring_sql_is_ignored() {
+        // A CREATE TABLE via f-string spark.sql produces no columns (unmappable)
+        // and does not crash the fold.
+        let src = r#"
+def run(spark, database):
+    spark.sql(f"CREATE NAMESPACE IF NOT EXISTS glue_cat.{database}")
+    spark.sql(f"CREATE TABLE {database}.t (`a` STRING) USING iceberg")
+"#;
+        let r = run(src);
+        assert!(r.columns.is_empty(), "no columns from DDL: {:?}", r.columns);
     }
 }

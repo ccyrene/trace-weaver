@@ -372,6 +372,13 @@ fn scan_decl(
     opts: &ScanOptions,
     doc: &mut WeaveDocument,
 ) {
+    // Column/dataflow-discovery declarations (Pass C) produce datasets and
+    // column-carrying edges but NO job, so they never enter the gate's task
+    // denominator. Handled on a dedicated, side-effect-free path.
+    if decl.column_only {
+        scan_column_discovery(path, decl, config, opts, doc);
+        return;
+    }
     let loc = SourceLoc::new(path, decl.line);
 
     // Tier 1: infer the engine when omitted — `sql` if a query is present,
@@ -568,6 +575,88 @@ fn scan_decl(
             }
             doc.edges.push(edge);
             first_edge = false;
+        }
+    }
+}
+
+/// Build datasets + column-carrying edges for a COLUMN/dataflow-discovery
+/// declaration (Pass C) — an undecorated, un-wired top-level function whose body
+/// was traced purely for column lineage (e.g. the `run(spark, …)` transform
+/// protocol; a `spark.sql(f"INSERT … SELECT CAST(…) FROM view")`).
+///
+/// Deliberately side-effect-light: it emits **no job** (so the gate task
+/// denominator is unchanged), no hygiene diagnostics, and no `W_OPAQUE_COLUMN`
+/// advisories. Every element it does emit is inferred (never declared/HIGH), and
+/// an edge is only pushed when it actually carries a column mapping.
+fn scan_column_discovery(
+    path: &str,
+    decl: &TaskDecl,
+    config: &ModuleConfig,
+    opts: &ScanOptions,
+    doc: &mut WeaveDocument,
+) {
+    if !opts.enable_code_inference {
+        return; // column discovery IS code inference — respect the opt-out
+    }
+    let engine = match &decl.engine {
+        Some(e) => Engine::from_str_loose(e),
+        None => Engine::Python,
+    };
+    let inputs: Vec<String> = decl.inputs.iter().map(|n| expand_fqn(n, config)).collect();
+    let outputs: Vec<String> = decl.outputs.iter().map(|n| expand_fqn(n, config)).collect();
+    // Need at least one endpoint on each side to hang a dataset→dataset edge.
+    if inputs.is_empty() || outputs.is_empty() {
+        return;
+    }
+    let _loc = SourceLoc::new(path, decl.line); // kept for parity / future use
+    let element_origin = discovered_origin(engine);
+
+    for ds_name in inputs.iter().chain(outputs.iter()) {
+        doc.upsert_dataset(build_dataset(ds_name, &element_origin));
+    }
+
+    let default_input = inputs.first().cloned();
+    let single_output = outputs.len() == 1;
+    for output in &outputs {
+        let col_edges = match &default_input {
+            Some(di) => build_output_column_edges(
+                decl,
+                output,
+                di,
+                &inputs,
+                None,
+                opts.enable_code_inference,
+                single_output,
+            ),
+            None => Vec::new(),
+        };
+        if col_edges.is_empty() {
+            continue;
+        }
+        for input in &inputs {
+            if input == output {
+                continue; // self-loops are noise for inferred discovery
+            }
+            let mut edge = Edge::new(input.clone(), output.clone());
+            edge.transform = Transform {
+                kind: decl.transform.clone(),
+                description: decl.description.clone(),
+                sql: None,
+            };
+            edge.origin = element_origin.clone();
+            for ce in &col_edges {
+                let attach = !ce.from_columns.is_empty()
+                    && ce.from_columns.iter().any(|fc| &fc.dataset == input);
+                if attach {
+                    edge.column_lineage.push(ce.clone());
+                }
+            }
+            // Only emit an edge that actually carries a column mapping — a bare
+            // dataset-level edge here would be noise (and would trip the
+            // no-column-lineage advisory).
+            if !edge.column_lineage.is_empty() {
+                doc.edges.push(edge);
+            }
         }
     }
 }
@@ -1682,6 +1771,140 @@ def dedupe():
         assert_eq!(
             module_path_of(root, Path::new("/repo/dags/pkg/__init__.py")),
             "pkg"
+        );
+    }
+
+    #[test]
+    fn dii_transform_run_yields_column_mappings_without_a_task() {
+        // The exact DII shape: an undecorated, un-wired top-level `run(spark, …)`
+        // with expected_columns validation, a temp view, and an f-string
+        // spark.sql INSERT whose SELECT/CAST list is fully static. Pass C must
+        // recover column mappings — but emit NO job (so the gate task denominator
+        // is untouched).
+        let src = r#"
+from pyspark.sql import functions as F
+def run(spark, src_path, database, table, first_run, job_id, load_date_str, target_catalogs="both"):
+    df = spark.read.format("parquet").load(src_path)
+    expected_columns = ["HOSPCODE", "PID", "SEQ", "DATE_SERV", "WEIGHT"]
+    actual_columns = df.columns
+    if len(actual_columns) != len(expected_columns):
+        raise ValueError("Column count mismatch.")
+    if set(actual_columns) != set(expected_columns):
+        raise ValueError("Column mismatch.")
+    full_table_name = f"glue_cat.{database}.{table}"
+    df.createOrReplaceTempView("raw_staging")
+    spark.sql(f"""
+        INSERT INTO {full_table_name}
+        SELECT
+            CAST(`HOSPCODE` AS STRING),
+            CAST(`PID` AS STRING),
+            CAST(`SEQ` AS INT),
+            CAST(`DATE_SERV` AS STRING),
+            `WEIGHT`
+        FROM raw_staging
+    """)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("zone_anc_mom.py", src, &opts(), &mut doc).unwrap();
+
+        // COLUMN discovery, not TASK discovery: no job enters the denominator.
+        assert!(
+            doc.jobs.is_empty(),
+            "Pass C must not create a job: {:?}",
+            doc.jobs.iter().map(|j| &j.id).collect::<Vec<_>>()
+        );
+        // But it DID recover per-column lineage.
+        let total_cols: usize = doc.edges.iter().map(|e| e.column_lineage.len()).sum();
+        assert!(total_cols > 0, "expected column mappings, got 0");
+        // The staging INSERT maps raw_staging.<col> -> <target>.<col>, CAST=xform.
+        let edge = doc
+            .edges
+            .iter()
+            .find(|e| e.from == "raw_staging")
+            .expect("raw_staging edge");
+        assert!(edge.origin.is_inferred(), "discovery edge is inferred");
+        let h = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "HOSPCODE")
+            .expect("HOSPCODE mapping");
+        assert_eq!(h.from_columns[0].column, "HOSPCODE");
+        assert_eq!(h.from_columns[0].dataset, "raw_staging");
+        assert_eq!(h.transform_type, TransformType::Transformation);
+        // A bare (uncast) column is an identity passthrough.
+        let w = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "WEIGHT")
+            .expect("WEIGHT mapping");
+        assert_eq!(w.transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn undecorated_helper_without_dataframe_ops_is_not_discovered() {
+        // Pass C only fires when the body actually yields column lineage. A plain
+        // helper with no DataFrame column flow contributes nothing (no job, no
+        // edge, no dataset) — so the scanner stays quiet on ordinary code.
+        let src = r#"
+def helper(x, y):
+    z = x + y
+    return z * 2
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("helper.py", src, &opts(), &mut doc).unwrap();
+        assert!(doc.jobs.is_empty());
+        assert!(doc.edges.is_empty());
+        assert!(doc.datasets.is_empty());
+    }
+
+    #[test]
+    fn dataflow_under_lineage_attaches_inferred_columns_but_keeps_declared_edge() {
+        // Regression for the un-suppress fix: a @lineage function whose body has a
+        // literal-dict .rename() must keep its DECLARED / HIGH-confidence dataset
+        // edge AND gain the inferred column mappings the analyzer finds.
+        use trace_weaver_core::OriginSource;
+        let src = r#"
+from traceweaver import lineage
+import pandas as pd
+@lineage(
+    inputs=["postgresql://conn/aoc.raw_mule"],
+    outputs=["postgresql://conn/aoc.temp_mule_trend"],
+)
+def load_data_from_parquet_to_temp_table():
+    df = pd.read_sql("SELECT * FROM raw_mule", con=E)
+    df = df.rename(columns={"case_code": "case_id", "amount": "amount_thb"})
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("etl.py", src, &opts(), &mut doc).unwrap();
+
+        // Exactly one @lineage task (the rename did NOT become a second task).
+        assert_eq!(doc.jobs.len(), 1);
+        assert!(
+            !doc.jobs[0].origin.is_inferred(),
+            "@lineage job is declared"
+        );
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        // Declared / HIGH confidence dataset edge preserved.
+        assert!(
+            !edge.origin.is_inferred(),
+            "declared @lineage edge must stay declared/HIGH"
+        );
+        // …with inferred column mappings merged beneath it.
+        let case_id = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "case_id")
+            .expect("inferred case_id mapping should attach under @lineage");
+        assert_eq!(case_id.origin.source, OriginSource::InferredCode);
+        assert_eq!(case_id.from_columns[0].column, "case_code");
+        assert_eq!(
+            case_id.from_columns[0].dataset,
+            "postgresql://conn/aoc.raw_mule"
+        );
+        assert_eq!(
+            case_id.to_column.dataset,
+            "postgresql://conn/aoc.temp_mule_trend"
         );
     }
 

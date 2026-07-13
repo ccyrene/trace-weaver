@@ -3,6 +3,47 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
+## 0.5.0
+
+### Added
+
+- **f-string SQL folding.** The pandas/Spark dataflow analyzer now folds an
+  `Expr::JoinedStr` argument to `spark.sql(f"…")` before parsing it. Literal
+  segments and v0.4-resolvable interpolations (`{NAME}` where `NAME` is a
+  module-level constant or a local string variable) fold to their value;
+  genuinely runtime interpolations (function parameters like
+  `{full_table_name}`) fold to a stable placeholder identifier so the
+  fully-static `SELECT`/`CAST` column list still parses. This unlocks
+  column-level lineage from the dominant real-world shape
+  `spark.sql(f"INSERT INTO {full_table_name} SELECT CAST(\`X\` AS STRING), … FROM staging")`,
+  including the `INSERT OVERWRITE` and `CREATE TABLE` variants. An
+  `INSERT … SELECT` with **no** explicit column list now names each projection
+  by its underlying column even through a `CAST(...)` wrapper, so those casts
+  still map `X <- X`.
+- **Undecorated transform discovery (Pass C) — column lineage, not tasks.** A
+  new discovery pass reaches module-top-level functions that neither a
+  trace-weaver decorator (Pass A) nor an Airflow operator (Pass B) claimed —
+  notably the `def run(spark, src_path, …)` transform protocol dispatched via
+  `importlib` at runtime. Their bodies are traced purely for **column
+  mappings**: each yields datasets and column-carrying edges but **no job**, so
+  the lineage gate's task denominator (`tasks_total` / `tasks_with_lineage` /
+  `tasks_annotated` and both coverage metrics) is unchanged — this is column
+  discovery, not task discovery.
+- **`createOrReplaceTempView` is modeled as a frame binding.**
+  `df.createOrReplaceTempView("v")` now binds the view name to the frame's
+  upstream table, so a later `spark.sql("… FROM v")` chains column lineage back
+  through `df` (or keeps the view name as the source dataset when the frame's
+  origin is unknown).
+
+### Changed
+
+- **Dataflow analysis is no longer suppressed under `@lineage`.** A
+  `@lineage`-decorated function's declared datasets stay **declared / HIGH**
+  confidence, but its body is now also traced so inferable column mappings
+  (e.g. a literal-dict `.rename()`, a `spark.sql` INSERT) attach beneath the
+  declaration. Previously the whole dataflow pass was skipped for `@lineage`,
+  silently discarding those mappings.
+
 ## 0.4.0
 
 ### Added

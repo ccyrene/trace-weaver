@@ -126,11 +126,24 @@ only its undeclared columns are inferred.
 `apply(lambda …)`; and column names from a **local string constant**
 (`col = "amount_usd"; out[col] = …`).
 
+**Auto (v0.5):** **f-string SQL** — `spark.sql(f"INSERT INTO {table} SELECT
+CAST(\`X\` AS STRING), … FROM staging")` folds its literal / resolvable
+interpolations and substitutes a placeholder for genuinely runtime ones (a
+function param like `{table}`), so the static `SELECT`/`CAST` column list still
+maps (`INSERT OVERWRITE` and column-list-less `INSERT` included);
+`createOrReplaceTempView("v")` binds `v` to its frame so a later
+`spark.sql("… FROM v")` chains through it; **undecorated transform functions**
+(`def run(spark, src_path, …)` dispatched via `importlib`) are traced for
+**column lineage only** — they contribute column-carrying edges but **no job**,
+so they never enter the lineage gate's task count; and a `@lineage`-declared
+function's body is now also traced, so inferable column mappings attach beneath
+its declared (HIGH-confidence) datasets.
+
 **Opaque → `W_OPAQUE_COLUMN` (declare or refactor):** column names from a
 **runtime** value (`out[x]=…` where `x` isn't a compile-time constant;
 `df.columns=[...]`; `pivot`/`melt`/`explode`); named UDFs / `.rdd` / `.pipe`;
-join columns that aren't keys; SQL or loops built at runtime (f-strings /
-`.format`).
+join columns that aren't keys; chain-reassignment loops
+(`for c in cols: df = df.withColumn(c, …)`).
 
 The do/don't guide with per-case rewrites is in
 [`TRACEABLE_PIPELINES.md`](TRACEABLE_PIPELINES.md).
