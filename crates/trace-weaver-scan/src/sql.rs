@@ -192,12 +192,16 @@ fn unwrap_select(body: &SetExpr) -> Option<&Select> {
 }
 
 /// For a bare-column projection with no alias, the output column name is the
-/// column itself.
+/// column itself. A `CAST(col AS type)` (or a chain of casts) with no alias
+/// keeps the underlying column's name — Spark preserves it — so an
+/// `INSERT … SELECT CAST(\`X\` AS STRING), … FROM t` with no explicit column
+/// list still yields `X <- X` mappings. `::type` postfix casts fold the same way.
 fn implicit_target_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(id) => Some(id.value.clone()),
         Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
         Expr::Nested(inner) => implicit_target_name(inner),
+        Expr::Cast { expr, .. } => implicit_target_name(expr),
         _ => None,
     }
 }
@@ -506,6 +510,43 @@ GROUP BY event_date;
         let lin2 = column_lineage_from_sql("INSERT INTO t (a, b, c) SELECT x FROM s").unwrap();
         assert_eq!(lin2.arity_mismatch, Some((1, 3)));
         assert!(lin2.mappings.is_empty());
+    }
+
+    #[test]
+    fn insert_without_column_list_names_cast_columns() {
+        // The DII transform shape: INSERT with no explicit column list and a
+        // SELECT of bare `CAST(\`X\` AS T)` items (backtick-quoted). Each item's
+        // implicit output name is its underlying column, so we still recover
+        // per-column lineage (X <- X, a cast => Transformation).
+        let sql = "INSERT INTO glue_cat.db.t SELECT CAST(`HOSPCODE` AS STRING), \
+                   CAST(`SEQ` AS INT), `WEIGHT` FROM raw_staging";
+        let lin = column_lineage_from_sql(sql).unwrap();
+        assert_eq!(lin.target_table.as_deref(), Some("t"));
+        assert!(lin.source_tables.contains(&"raw_staging".to_string()));
+        assert_eq!(lin.mappings.len(), 3);
+        let m: std::collections::HashMap<_, _> =
+            lin.mappings.iter().map(|m| (m.target.clone(), m)).collect();
+        assert_eq!(m["HOSPCODE"].transform_type, TransformType::Transformation);
+        assert_eq!(
+            m["HOSPCODE"].sources,
+            vec![SqlColRef {
+                table: None,
+                column: "HOSPCODE".into()
+            }]
+        );
+        // A bare column with no cast is identity.
+        assert_eq!(m["WEIGHT"].transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn insert_overwrite_is_parsed() {
+        // Spark's `INSERT OVERWRITE t SELECT …` (no INTO) must map like INSERT INTO.
+        let lin =
+            column_lineage_from_sql("INSERT OVERWRITE t SELECT CAST(`a` AS INT) FROM staging")
+                .unwrap();
+        assert_eq!(lin.target_table.as_deref(), Some("t"));
+        assert_eq!(lin.mappings.len(), 1);
+        assert_eq!(lin.mappings[0].target, "a");
     }
 
     #[test]

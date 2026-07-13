@@ -70,6 +70,12 @@ pub struct TaskDecl {
     /// representation, and recorded here so the scanner stamps them
     /// medium-confidence (inferred) provenance instead of declared/high.
     pub nonliteral: std::collections::HashSet<String>,
+    /// True when this declaration is a COLUMN/dataflow-discovery result (Pass C):
+    /// an undecorated, un-wired top-level function (e.g. the `run(spark, …)`
+    /// transform protocol) whose body was analyzed purely to recover column
+    /// mappings. Such a decl contributes datasets + column-carrying edges but
+    /// **no job**, so it never enters the gate's task denominator.
+    pub column_only: bool,
 }
 
 /// Per-file defaults from a module-level `tw.configure(...)` call and/or a
@@ -433,7 +439,18 @@ pub fn extract_task_decls_with(
         for deco in &func.decorator_list {
             if let Some(call) = lineage_decorator(deco, &lineage_names) {
                 decorated.insert(func.name.to_string());
-                tasks.push(build_lineage_decl(func.name.as_str(), call, source, &ctx));
+                let mut decl = build_lineage_decl(func.name.as_str(), call, source, &ctx);
+                // Un-suppress dataflow under @lineage: the declared datasets stay
+                // declared/HIGH, but we still trace the body so inferable column
+                // mappings (e.g. a literal-dict .rename(), a spark.sql INSERT)
+                // attach beneath the declaration. Purely additive — no new tasks.
+                // Opaque notes are intentionally NOT surfaced here: @lineage is a
+                // deliberate dataset-level declaration, so "declare this column in
+                // column_map" advisories would contradict its intent (mirroring the
+                // suppressed W_NO_COLUMN_LINEAGE) and would perturb diagnostics.
+                let r = crate::dataflow::analyze(&func.body, &consts, source);
+                decl.inferred_columns = r.columns;
+                tasks.push(decl);
                 continue 'func;
             }
         }
@@ -461,7 +478,97 @@ pub fn extract_task_decls_with(
     // decorator on the same function overrides (deduped by name).
     discover_operators(&suite, source, &consts, &funcs, &decorated, &mut tasks);
 
+    // Pass C: COLUMN/dataflow discovery for top-level functions that neither a
+    // trace-weaver decorator (Pass A) nor an Airflow operator (Pass B) reached —
+    // notably the `def run(spark, src_path, …)` transform protocol dispatched via
+    // importlib at runtime. These are analyzed for column lineage ONLY: each
+    // yields datasets + column-carrying edges but NO job, so it never enters the
+    // gate's task denominator (a machine-inferred column map, not a task).
+    let mut claimed = decorated.clone();
+    collect_python_callables(&suite, &mut claimed);
+    discover_dataflow_columns(&suite, source, &consts, &claimed, &mut tasks);
+
     Ok(ScannedModule { config, tasks })
+}
+
+/// Collect every function name bound to a `python_callable=<Name>` on any
+/// operator constructor, recursing into block bodies. These functions are
+/// already reached by Pass B, so Pass C must not re-analyze them.
+fn collect_python_callables(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    for stmt in stmts {
+        let call = match stmt {
+            Stmt::Assign(a) => match a.value.as_ref() {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            Stmt::Expr(e) => match e.value.as_ref() {
+                Expr::Call(c) => Some(c),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(c) = call {
+            if let Some(Expr::Name(f)) = kwarg(c, "python_callable") {
+                out.insert(f.id.to_string());
+            }
+        }
+        match stmt {
+            Stmt::With(w) => collect_python_callables(&w.body, out),
+            Stmt::If(i) => {
+                collect_python_callables(&i.body, out);
+                collect_python_callables(&i.orelse, out);
+            }
+            Stmt::For(f) => collect_python_callables(&f.body, out),
+            Stmt::While(w) => collect_python_callables(&w.body, out),
+            Stmt::Try(t) => {
+                collect_python_callables(&t.body, out);
+                collect_python_callables(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pass C worker: for every module-top-level function not already `claimed`
+/// (decorated, or wired as a `python_callable`), trace its body for column
+/// lineage and — when the trace found any column mappings — emit a
+/// `column_only` [`TaskDecl`]. Functions whose body yields no columns are
+/// skipped entirely (no datasets, no edges, no diagnostics, no job).
+fn discover_dataflow_columns(
+    suite: &[Stmt],
+    source: &str,
+    consts: &HashMap<String, String>,
+    claimed: &std::collections::HashSet<String>,
+    tasks: &mut Vec<TaskDecl>,
+) {
+    for stmt in suite {
+        let func = match stmt {
+            Stmt::FunctionDef(f) => f,
+            _ => continue,
+        };
+        let name = func.name.as_str();
+        if claimed.contains(name) || tasks.iter().any(|t| t.task_name == name) {
+            continue;
+        }
+        let r = crate::dataflow::analyze(&func.body, consts, source);
+        if r.columns.is_empty() {
+            continue; // nothing column-level we can see — not a data transform
+        }
+        tasks.push(TaskDecl {
+            task_name: name.to_string(),
+            inputs: r.inputs,
+            outputs: r.outputs,
+            engine: Some(r.engine.unwrap_or_else(|| "python".to_string())),
+            inferred_columns: r.columns,
+            line: Some(byte_to_line(source, func.range().start().to_usize())),
+            discovered: true,
+            column_only: true,
+            // Opaque notes are intentionally dropped: these are discovery
+            // targets, not authored tasks, so "declare this column" advisories
+            // would be noise and would perturb diagnostic counts.
+            ..Default::default()
+        });
+    }
 }
 
 /// One keyword argument of a call by name.
