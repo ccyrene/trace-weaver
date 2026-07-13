@@ -90,6 +90,280 @@ pub struct ScannedModule {
     pub tasks: Vec<TaskDecl>,
 }
 
+/// Maximum `NAME = OTHER_NAME` alias hops followed when resolving a module-level
+/// constant. Deep chains are unusual; the cap plus the visited-set cycle guard
+/// keep resolution bounded and terminate on `A = B; B = A`.
+const MAX_ALIAS_DEPTH: usize = 8;
+
+/// A repo-wide table of module-level string constants, keyed by the dotted
+/// module path a file would be imported under (e.g. `config.datasets`). Built by
+/// [`scan_path`](crate::scan_path) before any file is scanned, so a `@lineage`
+/// dataset declared as `from config.datasets import RAW_SALES` resolves to the
+/// literal defined in the other file — staying declared/HIGH confidence rather
+/// than falling back to inferred/MEDIUM.
+///
+/// Values are fully resolved string literals: local `NAME = OTHER_NAME` aliasing
+/// (bounded by [`MAX_ALIAS_DEPTH`] with a cycle guard) is collapsed at build
+/// time, so a lookup returns the final string or nothing.
+#[derive(Debug, Clone, Default)]
+pub struct ConstTable {
+    modules: HashMap<String, HashMap<String, String>>,
+}
+
+impl ConstTable {
+    /// Record one module's resolved constants under its dotted path.
+    pub fn insert_module(
+        &mut self,
+        module_path: impl Into<String>,
+        consts: HashMap<String, String>,
+    ) {
+        if consts.is_empty() {
+            return;
+        }
+        self.modules.insert(module_path.into(), consts);
+    }
+
+    /// Look up `name` in `module`. Tries an exact module match first, then a
+    /// unique suffix match so a scan root that sits above the Python import root
+    /// (or below it) still resolves — but only when exactly ONE module carries
+    /// the name, never guessing between ambiguous candidates.
+    fn lookup(&self, module: &str, name: &str) -> Option<&String> {
+        if let Some(v) = self.modules.get(module).and_then(|m| m.get(name)) {
+            return Some(v);
+        }
+        let dotted_module = format!(".{module}");
+        let mut hit = None;
+        let mut count = 0usize;
+        for (key, consts) in &self.modules {
+            let related = key == module
+                || key.ends_with(&dotted_module)
+                || module.ends_with(&format!(".{key}"));
+            if related {
+                if let Some(v) = consts.get(name) {
+                    hit = Some(v);
+                    count += 1;
+                }
+            }
+        }
+        (count == 1).then_some(hit).flatten()
+    }
+}
+
+/// Collect the module-level string constants of one source file, with one-level
+/// (`NAME = OTHER_NAME`) aliasing resolved. Used to seed [`ConstTable`].
+pub fn collect_module_constants(source: &str) -> HashMap<String, String> {
+    match ast::Suite::parse(source, "<module>") {
+        Ok(suite) => constants_from_suite(&suite),
+        Err(_) => HashMap::new(),
+    }
+}
+
+/// Gather module-level `NAME = "literal"` constants from a parsed suite, folding
+/// `NAME = OTHER_NAME` aliases into their ultimate literal value. Alias chains
+/// are followed up to [`MAX_ALIAS_DEPTH`] hops with a visited-set cycle guard;
+/// a dangling or cyclic alias simply resolves to nothing.
+fn constants_from_suite(suite: &[Stmt]) -> HashMap<String, String> {
+    let mut literals: HashMap<String, String> = HashMap::new();
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    for stmt in suite {
+        if let Stmt::Assign(assign) = stmt {
+            let name = match single_target_name(&assign.targets) {
+                Some(n) => n,
+                None => continue,
+            };
+            if let Some(s) = const_str(&assign.value) {
+                literals.insert(name, s);
+            } else if let Expr::Name(n) = assign.value.as_ref() {
+                // NAME = OTHER_NAME — a one-level alias (chains resolved below).
+                aliases.insert(name, n.id.to_string());
+            }
+        }
+    }
+    let mut out = literals.clone();
+    for (name, first) in &aliases {
+        if out.contains_key(name) {
+            continue; // a literal binding always wins over an alias
+        }
+        let mut target = first.clone();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        seen.insert(name.clone());
+        for _ in 0..MAX_ALIAS_DEPTH {
+            if !seen.insert(target.clone()) {
+                break; // cycle
+            }
+            if let Some(s) = literals.get(&target) {
+                out.insert(name.clone(), s.clone());
+                break;
+            }
+            match aliases.get(&target) {
+                Some(next) => target = next.clone(),
+                None => break, // dangling
+            }
+        }
+    }
+    out
+}
+
+/// Import bindings collected from a consuming file, used to resolve dataset
+/// references that name a constant living in another module.
+#[derive(Debug, Default)]
+struct ImportEnv {
+    /// `from MODULE import NAME [as LOCAL]` → LOCAL ⇒ (MODULE, NAME).
+    from_imports: HashMap<String, (String, String)>,
+    /// `import MODULE as ALIAS` → ALIAS ⇒ MODULE (the dotted module path).
+    module_aliases: HashMap<String, String>,
+}
+
+/// Bundle of everything the decl-builders need to resolve decorator arguments:
+/// the current file's local constants, its import bindings, and the repo-wide
+/// [`ConstTable`]. Local/same-module resolution never needs the table.
+struct Ctx<'a> {
+    consts: &'a HashMap<String, String>,
+    imports: ImportEnv,
+    table: &'a ConstTable,
+}
+
+impl Ctx<'_> {
+    /// Resolve an expression used in a **dataset** position (`@lineage`/`@tw`
+    /// `inputs=`/`outputs=`) to a string literal, following module-level
+    /// constants across files:
+    ///   * a string literal, or
+    ///   * a bare `NAME` defined in this module, or
+    ///   * a bare `NAME` brought in by `from MODULE import NAME [as ..]`, or
+    ///   * an attribute `m.NAME` / `pkg.mod.NAME` where the module part was
+    ///     `import`ed (aliased or dotted).
+    ///
+    /// Returns `None` for anything else (calls, f-strings, subscripts, unknown
+    /// names) so callers keep today's medium/inferred fallback — never a guess.
+    fn dataset_str(&self, expr: &Expr) -> Option<String> {
+        if let Some(s) = const_str(expr) {
+            return Some(s);
+        }
+        match expr {
+            Expr::Name(n) => {
+                let id = n.id.as_str();
+                if let Some(s) = self.consts.get(id) {
+                    return Some(s.clone());
+                }
+                if let Some((module, orig)) = self.imports.from_imports.get(id) {
+                    return self.table.lookup(module, orig).cloned();
+                }
+                None
+            }
+            Expr::Attribute(a) => {
+                let base = dotted_path(&a.value)?;
+                let module = self
+                    .imports
+                    .module_aliases
+                    .get(&base)
+                    .cloned()
+                    .unwrap_or(base);
+                self.table.lookup(&module, a.attr.as_str()).cloned()
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve a list/tuple of dataset strings, dropping any element that does
+    /// not resolve (mirrors [`resolve_str_list`], but constant-aware across
+    /// files). Non-list expressions yield an empty vec.
+    fn dataset_str_list(&self, expr: &Expr) -> Vec<String> {
+        let elts = match expr {
+            Expr::List(l) => &l.elts,
+            Expr::Tuple(t) => &t.elts,
+            _ => return Vec::new(),
+        };
+        elts.iter().filter_map(|e| self.dataset_str(e)).collect()
+    }
+
+    /// True if `expr` is a list/tuple with at least one element that could not
+    /// be resolved to a dataset string (so some entries were dropped), or is not
+    /// a list at all.
+    fn dataset_list_has_unresolved(&self, expr: &Expr) -> bool {
+        match expr {
+            Expr::List(l) => l.elts.iter().any(|e| self.dataset_str(e).is_none()),
+            Expr::Tuple(t) => t.elts.iter().any(|e| self.dataset_str(e).is_none()),
+            _ => true,
+        }
+    }
+}
+
+/// Reconstruct a dotted module path (`a.b.c`) from a `Name`/`Attribute` chain,
+/// or `None` if the expression is anything else (e.g. a subscript or call).
+fn dotted_path(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        Expr::Attribute(a) => Some(format!("{}.{}", dotted_path(&a.value)?, a.attr)),
+        _ => None,
+    }
+}
+
+/// Collect a consuming file's `import` / `from ... import` bindings. `module_path`
+/// is the current file's own dotted path, used to resolve relative imports
+/// (`from .datasets import X`) against its package.
+fn collect_imports(suite: &[Stmt], module_path: &str) -> ImportEnv {
+    let mut env = ImportEnv::default();
+    for stmt in suite {
+        match stmt {
+            Stmt::Import(imp) => {
+                for alias in &imp.names {
+                    let module = alias.name.to_string();
+                    // `import a.b.c as m` binds m ⇒ a.b.c. Without `as`, `a.b.c.NAME`
+                    // is reconstructed directly by `dotted_path`, so no binding is
+                    // needed — but record the leading name for completeness.
+                    if let Some(asname) = &alias.asname {
+                        env.module_aliases.insert(asname.to_string(), module);
+                    }
+                }
+            }
+            Stmt::ImportFrom(imp) => {
+                let level = imp.level.as_ref().map(|l| l.to_usize()).unwrap_or(0);
+                let base = match &imp.module {
+                    Some(m) => m.to_string(),
+                    None => String::new(),
+                };
+                let module = resolve_import_module(module_path, level, &base);
+                for alias in &imp.names {
+                    let orig = alias.name.to_string();
+                    if orig == "*" {
+                        continue; // star import — nothing statically nameable
+                    }
+                    let local = alias
+                        .asname
+                        .as_ref()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| orig.clone());
+                    env.from_imports.insert(local, (module.clone(), orig));
+                }
+            }
+            _ => {}
+        }
+    }
+    env
+}
+
+/// Resolve the target module of a (possibly relative) `from` import to an
+/// absolute dotted path. `level` is the number of leading dots; `base` is the
+/// text after them (may be empty for `from . import x`).
+fn resolve_import_module(current: &str, level: usize, base: &str) -> String {
+    if level == 0 {
+        return base.to_string();
+    }
+    // A relative import is anchored at the current module's package. `current`
+    // is the file's own module path, so drop its final segment (the module
+    // name) plus one for each extra dot beyond the first.
+    let mut parts: Vec<&str> = current.split('.').filter(|s| !s.is_empty()).collect();
+    for _ in 0..level {
+        parts.pop();
+    }
+    let pkg = parts.join(".");
+    match (pkg.is_empty(), base.is_empty()) {
+        (true, _) => base.to_string(),
+        (false, true) => pkg,
+        (false, false) => format!("{pkg}.{base}"),
+    }
+}
+
 /// Which decorator form produced a [`TaskDecl`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DecoratorKind {
@@ -105,21 +379,31 @@ enum DecoratorKind {
 /// Recognises decorators whose callee final segment is `task`
 /// (the full form) or `sql` (the `@tw.sql(QUERY, …)` shortcut).
 pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
+    extract_task_decls_with(source, "", &ConstTable::default())
+}
+
+/// Like [`extract_task_decls`], but resolves dataset references against the
+/// repo-wide [`ConstTable`]. `module_path` is this file's own dotted module path
+/// (used to anchor relative `from . import` statements). Dataset strings in
+/// `@lineage`/`@tw` `inputs=`/`outputs=` that name a module-level string
+/// constant — locally or via `import`/`from ... import` — resolve to the literal
+/// and stay declared/HIGH confidence.
+pub fn extract_task_decls_with(
+    source: &str,
+    module_path: &str,
+    table: &ConstTable,
+) -> anyhow::Result<ScannedModule> {
     let suite = ast::Suite::parse(source, "<module>")
         .map_err(|e| anyhow::anyhow!("python parse error: {e}"))?;
 
-    // First pass: collect module-level string constants `NAME = "..."`.
-    let mut consts: HashMap<String, String> = HashMap::new();
-    for stmt in &suite {
-        if let Stmt::Assign(assign) = stmt {
-            if let (Some(name), Some(s)) = (
-                single_target_name(&assign.targets),
-                const_str(&assign.value),
-            ) {
-                consts.insert(name, s);
-            }
-        }
-    }
+    // First pass: collect module-level string constants (`NAME = "..."`, plus
+    // one-level `NAME = OTHER_NAME` aliasing), and this file's import bindings.
+    let consts = constants_from_suite(&suite);
+    let ctx = Ctx {
+        consts: &consts,
+        imports: collect_imports(&suite, module_path),
+        table,
+    };
 
     let config = extract_module_config(&suite, &consts);
 
@@ -149,12 +433,7 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
         for deco in &func.decorator_list {
             if let Some(call) = lineage_decorator(deco, &lineage_names) {
                 decorated.insert(func.name.to_string());
-                tasks.push(build_lineage_decl(
-                    func.name.as_str(),
-                    call,
-                    source,
-                    &consts,
-                ));
+                tasks.push(build_lineage_decl(func.name.as_str(), call, source, &ctx));
                 continue 'func;
             }
         }
@@ -162,7 +441,7 @@ pub fn extract_task_decls(source: &str) -> anyhow::Result<ScannedModule> {
         for deco in &func.decorator_list {
             if let Some((call, kind)) = task_decorator_call(deco) {
                 decorated.insert(func.name.to_string());
-                let mut decl = build_decl(func.name.as_str(), call, source, &consts, kind);
+                let mut decl = build_decl(func.name.as_str(), call, source, &ctx, kind);
                 // Trace the function body for column lineage (pandas/Spark). SQL
                 // tasks are handled by the SQL analyzer, so skip dataflow there.
                 if !matches!(kind, DecoratorKind::Sql) && decl.engine.as_deref() != Some("sql") {
@@ -481,7 +760,7 @@ fn build_lineage_decl(
     name: &str,
     call: Option<&ast::ExprCall>,
     source: &str,
-    consts: &HashMap<String, String>,
+    ctx: &Ctx,
 ) -> TaskDecl {
     let mut decl = TaskDecl {
         task_name: name.to_string(),
@@ -502,23 +781,23 @@ fn build_lineage_decl(
         };
         match key.as_str() {
             "inputs" => {
-                let (vals, nl) = resolve_uri_list(&kw.value, consts, source);
+                let (vals, nl) = resolve_uri_list(&kw.value, ctx, source);
                 decl.inputs = vals;
                 decl.nonliteral.extend(nl);
             }
             "outputs" => {
-                let (vals, nl) = resolve_uri_list(&kw.value, consts, source);
+                let (vals, nl) = resolve_uri_list(&kw.value, ctx, source);
                 decl.outputs = vals;
                 decl.nonliteral.extend(nl);
             }
             "name" => {
-                if let Some(s) = resolve_str(&kw.value, consts) {
+                if let Some(s) = resolve_str(&kw.value, ctx.consts) {
                     if !s.is_empty() {
                         decl.task_name = s;
                     }
                 }
             }
-            "description" => match resolve_str(&kw.value, consts) {
+            "description" => match resolve_str(&kw.value, ctx.consts) {
                 Some(s) => decl.description = Some(s),
                 None if is_explicit_none(&kw.value) => {}
                 None => decl.description = Some(expr_source_text(&kw.value, source)),
@@ -534,11 +813,7 @@ fn build_lineage_decl(
 /// Unlike [`resolve_str_list`], non-literal elements are NOT dropped: each is
 /// kept as its best-effort source text and also returned in the second vec. A
 /// non-list value (e.g. a bare variable) is treated as one non-literal entry.
-fn resolve_uri_list(
-    expr: &Expr,
-    consts: &HashMap<String, String>,
-    source: &str,
-) -> (Vec<String>, Vec<String>) {
+fn resolve_uri_list(expr: &Expr, ctx: &Ctx, source: &str) -> (Vec<String>, Vec<String>) {
     let elts = match expr {
         Expr::List(l) => &l.elts,
         Expr::Tuple(t) => &t.elts,
@@ -550,7 +825,7 @@ fn resolve_uri_list(
     let mut vals = Vec::new();
     let mut nonlit = Vec::new();
     for e in elts {
-        match resolve_str(e, consts) {
+        match ctx.dataset_str(e) {
             Some(s) => vals.push(s),
             None => {
                 let text = expr_source_text(e, source);
@@ -667,9 +942,10 @@ fn build_decl(
     name: &str,
     call: &ast::ExprCall,
     source: &str,
-    consts: &HashMap<String, String>,
+    ctx: &Ctx,
     kind: DecoratorKind,
 ) -> TaskDecl {
+    let consts = ctx.consts;
     let mut decl = TaskDecl {
         task_name: name.to_string(),
         line: Some(byte_to_line(source, call.range().start().to_usize())),
@@ -705,14 +981,14 @@ fn build_decl(
         match key.as_str() {
             "dag" => scalar(&mut decl.dag, &kw.value),
             "inputs" => {
-                decl.inputs = resolve_str_list(&kw.value, consts);
-                if list_has_unresolved(&kw.value, consts) {
+                decl.inputs = ctx.dataset_str_list(&kw.value);
+                if ctx.dataset_list_has_unresolved(&kw.value) {
                     decl.unresolved.push(key.clone());
                 }
             }
             "outputs" => {
-                decl.outputs = resolve_str_list(&kw.value, consts);
-                if list_has_unresolved(&kw.value, consts) {
+                decl.outputs = ctx.dataset_str_list(&kw.value);
+                if ctx.dataset_list_has_unresolved(&kw.value) {
                     decl.unresolved.push(key.clone());
                 }
             }
@@ -1075,6 +1351,239 @@ def build():
         assert!(d.inputs[0].contains("f\"s3://raw/"));
         assert!(d.nonliteral.contains(&d.inputs[0]));
         assert!(!d.nonliteral.contains(&d.inputs[1]));
+    }
+
+    /// A `ConstTable` with one module's constants, for cross-module tests.
+    fn table(module: &str, pairs: &[(&str, &str)]) -> ConstTable {
+        let mut t = ConstTable::default();
+        let m: HashMap<String, String> = pairs
+            .iter()
+            .map(|&(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        t.insert_module(module, m);
+        t
+    }
+
+    #[test]
+    fn lineage_resolves_bare_name_in_same_module() {
+        // Form (a): a bare Name defined in the SAME module resolves to its literal
+        // and stays declared (NOT recorded as non-literal).
+        let src = r#"
+from trace_weaver import lineage
+RAW = "s3://raw/sales.parquet"
+OUT = "iceberg://w.db.bronze"
+@lineage(inputs=[RAW], outputs=[OUT])
+def f():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert_eq!(d.outputs, vec!["iceberg://w.db.bronze"]);
+        assert!(d.nonliteral.is_empty(), "resolved constants are declared");
+    }
+
+    #[test]
+    fn lineage_resolves_from_import_constant() {
+        // Form (b): `from config.datasets import RAW_SALES`.
+        let src = r#"
+from trace_weaver import lineage
+from config.datasets import RAW_SALES, BRONZE
+@lineage(inputs=[RAW_SALES], outputs=[BRONZE])
+def f():
+    pass
+"#;
+        let t = table(
+            "config.datasets",
+            &[
+                ("RAW_SALES", "s3://raw/sales.parquet"),
+                ("BRONZE", "iceberg://w.db.bronze"),
+            ],
+        );
+        let m = extract_task_decls_with(src, "services.x", &t).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert_eq!(d.outputs, vec!["iceberg://w.db.bronze"]);
+        assert!(d.nonliteral.is_empty());
+    }
+
+    #[test]
+    fn lineage_resolves_from_import_alias() {
+        // Form (b) with `as`: `from config.datasets import RAW_SALES as RAW`.
+        let src = r#"
+from trace_weaver import lineage
+from config.datasets import RAW_SALES as RAW
+@lineage(inputs=[RAW], outputs=["iceberg://w.db.bronze"])
+def f():
+    pass
+"#;
+        let t = table(
+            "config.datasets",
+            &[("RAW_SALES", "s3://raw/sales.parquet")],
+        );
+        let m = extract_task_decls_with(src, "services.x", &t).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert!(d.nonliteral.is_empty());
+    }
+
+    #[test]
+    fn lineage_resolves_import_module_alias_attribute() {
+        // Form (c): `import config.datasets as ds` + `ds.RAW_SALES`.
+        let src = r#"
+from trace_weaver import lineage
+import config.datasets as ds
+@lineage(inputs=[ds.RAW_SALES], outputs=[ds.BRONZE])
+def f():
+    pass
+"#;
+        let t = table(
+            "config.datasets",
+            &[
+                ("RAW_SALES", "s3://raw/sales.parquet"),
+                ("BRONZE", "iceberg://w.db.bronze"),
+            ],
+        );
+        let m = extract_task_decls_with(src, "services.x", &t).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert_eq!(d.outputs, vec!["iceberg://w.db.bronze"]);
+        assert!(d.nonliteral.is_empty());
+    }
+
+    #[test]
+    fn lineage_resolves_import_dotted_attribute_without_alias() {
+        // Form (c) without `as`: `import config.datasets` + `config.datasets.RAW_SALES`.
+        let src = r#"
+from trace_weaver import lineage
+import config.datasets
+@lineage(inputs=[config.datasets.RAW_SALES], outputs=["iceberg://w.db.bronze"])
+def f():
+    pass
+"#;
+        let t = table(
+            "config.datasets",
+            &[("RAW_SALES", "s3://raw/sales.parquet")],
+        );
+        let m = extract_task_decls_with(src, "services.x", &t).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert!(d.nonliteral.is_empty());
+    }
+
+    #[test]
+    fn one_level_constant_aliasing_resolves() {
+        // `NAME = OTHER_NAME` aliasing (with a further hop) collapses to the literal.
+        let src = r#"
+from trace_weaver import lineage
+BASE = "s3://raw/sales.parquet"
+MID = BASE
+RAW = MID
+@lineage(inputs=[RAW], outputs=["iceberg://w.db.bronze"])
+def f():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["s3://raw/sales.parquet"]);
+        assert!(d.nonliteral.is_empty());
+    }
+
+    #[test]
+    fn constant_alias_cycle_does_not_hang_or_resolve() {
+        // A cyclic alias (A = B; B = A) resolves to nothing and is kept as text.
+        let src = r#"
+from trace_weaver import lineage
+A = B
+B = A
+@lineage(inputs=[A], outputs=["iceberg://w.db.bronze"])
+def f():
+    pass
+"#;
+        let m = extract_task_decls(src).unwrap();
+        let d = &m.tasks[0];
+        // Unresolved => kept verbatim and flagged non-literal (medium).
+        assert_eq!(d.inputs[0], "A");
+        assert!(d.nonliteral.contains("A"));
+    }
+
+    #[test]
+    fn unsupported_forms_fall_back_to_nonliteral_text() {
+        // Each unsupported reference is kept verbatim and flagged non-literal:
+        // an unknown name, a function call, an f-string, and a subscript.
+        let src = r#"
+from trace_weaver import lineage
+KNOWN = "s3://raw/known.parquet"
+DAY = "2024-01-01"
+CFG = {"raw": "s3://x"}
+@lineage(
+    inputs=[
+        MISSING,
+        make_uri(),
+        f"s3://raw/{DAY}.parquet",
+        CFG["raw"],
+        KNOWN,
+    ],
+    outputs=["iceberg://w.db.bronze"],
+)
+def f():
+    pass
+"#;
+        // Table has no matching module, so cross-module lookups also miss.
+        let m = extract_task_decls_with(src, "services.x", &ConstTable::default()).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs.len(), 5);
+        // Only the last (literal constant) resolved; the four others are text.
+        assert_eq!(d.inputs[4], "s3://raw/known.parquet");
+        assert!(!d.nonliteral.contains(&d.inputs[4]));
+        assert!(d.nonliteral.contains("MISSING"));
+        assert!(d.nonliteral.contains("make_uri()"));
+        assert!(d.nonliteral.iter().any(|s| s.contains("f\"s3://raw/")));
+        assert!(d.nonliteral.iter().any(|s| s.contains("CFG[")));
+    }
+
+    #[test]
+    fn tw_task_inputs_resolve_from_import_without_flag() {
+        // @tw.task shares the dataset extraction path: a from-imported constant in
+        // inputs=/outputs= resolves and is NOT flagged W_NON_LITERAL (unresolved).
+        let src = r#"
+import trace_weaver as tw
+from config.tables import BRONZE, SILVER
+@tw.task(inputs=[BRONZE], outputs=[SILVER], engine="pandas")
+def build():
+    pass
+"#;
+        let t = table(
+            "config.tables",
+            &[
+                ("BRONZE", "svc.db.sch.bronze"),
+                ("SILVER", "svc.db.sch.silver"),
+            ],
+        );
+        let m = extract_task_decls_with(src, "dags.build", &t).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["svc.db.sch.bronze"]);
+        assert_eq!(d.outputs, vec!["svc.db.sch.silver"]);
+        assert!(
+            d.unresolved.is_empty(),
+            "resolved constants must not flag W_NON_LITERAL: {:?}",
+            d.unresolved
+        );
+    }
+
+    #[test]
+    fn tw_task_unresolved_input_still_flagged() {
+        // Contrast: an unknown name in @tw.task inputs is dropped and flagged.
+        let src = r#"
+import trace_weaver as tw
+@tw.task(inputs=[MISSING, "svc.db.sch.ok"], outputs=["svc.db.sch.out"], engine="pandas")
+def build():
+    pass
+"#;
+        let m = extract_task_decls_with(src, "dags.build", &ConstTable::default()).unwrap();
+        let d = &m.tasks[0];
+        assert_eq!(d.inputs, vec!["svc.db.sch.ok"]);
+        assert!(d.unresolved.contains(&"inputs".to_string()));
     }
 
     #[test]

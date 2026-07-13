@@ -3,6 +3,31 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
+## 0.4.0
+
+### Added
+
+- **Module-level string constants resolve in lineage declarations.** Dataset
+  URIs (and OM FQNs) in `@lineage` / `@tw.task` / `@tw.sql` `inputs=`/`outputs=`
+  may now reference a module-level string constant instead of an inline literal,
+  and still resolve to **declared / HIGH confidence** — so teams can centralize
+  URIs in a shared `config/datasets.py` without dropping to inferred/MEDIUM.
+  Before scanning any file, `scan_path` builds a repo-wide constant symbol table
+  (`ConstTable`) keyed by the dotted module path a file would be imported under
+  (`config/datasets.py` → `config.datasets`), collecting every module-level
+  `NAME = "literal"` assignment. One-level `NAME = OTHER_NAME` aliasing is
+  followed too (bounded depth, cycle-guarded). The supported reference forms are:
+  - a bare `NAME` defined in the **same** module;
+  - `from pkg.mod import NAME` (and `... import NAME as ALIAS`);
+  - `import pkg.mod [as m]` followed by `m.NAME` / `pkg.mod.NAME` attribute access.
+
+  Anything that is not a compile-time string — a missing/undefined name, a
+  function call, an f-string with placeholders, a subscript, or a cyclic alias —
+  keeps today's behavior: the source text is preserved and the endpoint is
+  stamped **medium / inferred** (for `@lineage`) or dropped with a
+  `W_NON_LITERAL` diagnostic (for `@tw.task`/`@tw.sql`). The scanner never
+  guesses a value it cannot see statically.
+
 ## 0.3.0
 
 ### Added

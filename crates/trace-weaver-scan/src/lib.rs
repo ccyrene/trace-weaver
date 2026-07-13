@@ -98,6 +98,15 @@ const LINEAGE_NONLITERAL_NOTE: &str = "@lineage non-literal dataset (best-effort
 pub fn scan_path(root: &Path, opts: &ScanOptions) -> anyhow::Result<WeaveDocument> {
     let mut doc = WeaveDocument::new(opts.namespace.clone(), opts.producer.clone());
 
+    // First walk: read every `*.py` file once, deriving the dotted module path it
+    // would be imported under. Sources are cached so the constant-table pass and
+    // the scan pass don't re-read (or re-fail) the disk.
+    struct SourceFile {
+        path_str: String,
+        module_path: String,
+        source: String,
+    }
+    let mut files: Vec<SourceFile> = Vec::new();
     for entry in walkdir::WalkDir::new(root)
         .into_iter()
         .filter_map(|e| e.ok())
@@ -110,22 +119,44 @@ pub fn scan_path(root: &Path, opts: &ScanOptions) -> anyhow::Result<WeaveDocumen
             continue;
         }
         let path_str = path.display().to_string();
-        let source = match std::fs::read_to_string(path) {
-            Ok(s) => s,
-            Err(e) => {
-                doc.diagnostics.push(
-                    Diagnostic::error("E_READ", format!("could not read {path_str}: {e}"))
-                        .at(SourceLoc::new(path_str.clone(), None)),
-                );
-                continue;
-            }
-        };
-        // Per-file errors are collected as diagnostics; one bad file must not
-        // abort the whole scan.
-        if let Err(e) = scan_source(&path_str, &source, opts, &mut doc) {
-            doc.diagnostics.push(
-                Diagnostic::error("E_PARSE", format!("failed to scan {path_str}: {e}"))
+        match std::fs::read_to_string(path) {
+            Ok(source) => files.push(SourceFile {
+                module_path: module_path_of(root, path),
+                path_str,
+                source,
+            }),
+            Err(e) => doc.diagnostics.push(
+                Diagnostic::error("E_READ", format!("could not read {path_str}: {e}"))
                     .at(SourceLoc::new(path_str.clone(), None)),
+            ),
+        }
+    }
+
+    // Build the repo-wide constant symbol table BEFORE scanning any file, so a
+    // dataset declared as `from config.datasets import RAW_SALES` resolves even
+    // when its defining file is scanned later.
+    let mut table = python::ConstTable::default();
+    for f in &files {
+        table.insert_module(
+            f.module_path.clone(),
+            python::collect_module_constants(&f.source),
+        );
+    }
+
+    // Second pass: scan each file with the table in scope. Per-file errors are
+    // collected as diagnostics; one bad file must not abort the whole scan.
+    for f in &files {
+        if let Err(e) = scan_source_with_table(
+            &f.path_str,
+            &f.module_path,
+            &f.source,
+            &table,
+            opts,
+            &mut doc,
+        ) {
+            doc.diagnostics.push(
+                Diagnostic::error("E_PARSE", format!("failed to scan {}: {e}", f.path_str))
+                    .at(SourceLoc::new(f.path_str.clone(), None)),
             );
         }
     }
@@ -244,14 +275,63 @@ fn code_inference_pass(doc: &mut WeaveDocument) {
     }
 }
 
-/// Scan a single Python source string into `doc` (used directly in tests).
+/// Derive the dotted module path a file would be imported under, relative to the
+/// scan `root` — mirroring how Python's import machinery sees a file when `root`
+/// is on `sys.path`. `pkg/mod.py` → `pkg.mod`; a package's `__init__.py` →
+/// `pkg`. Falls back to the bare file stem when the path is not under `root`.
+fn module_path_of(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let mut parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str().map(|s| s.to_string()),
+            _ => None,
+        })
+        .collect();
+    if let Some(last) = parts.last_mut() {
+        if let Some(stem) = last.strip_suffix(".py") {
+            *last = stem.to_string();
+        }
+        // A package's __init__ IS the package; drop the trailing segment.
+        if parts.last().map(|s| s == "__init__").unwrap_or(false) {
+            parts.pop();
+        }
+    }
+    if parts.is_empty() {
+        // e.g. root itself is the file — use its stem.
+        return path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+    }
+    parts.join(".")
+}
+
+/// Scan a single Python source string into `doc` (used directly in tests). This
+/// resolves only same-file constants; cross-module constant resolution requires
+/// the repo-wide table built by [`scan_path`].
 pub fn scan_source(
     path: &str,
     source: &str,
     opts: &ScanOptions,
     doc: &mut WeaveDocument,
 ) -> anyhow::Result<()> {
-    let module = python::extract_task_decls(source)?;
+    scan_source_with_table(path, "", source, &python::ConstTable::default(), opts, doc)
+}
+
+/// Scan one source with a repo-wide [`ConstTable`](python::ConstTable) in scope,
+/// so dataset references to constants in OTHER modules resolve. `module_path` is
+/// this file's own dotted module path (anchors relative imports).
+fn scan_source_with_table(
+    path: &str,
+    module_path: &str,
+    source: &str,
+    table: &python::ConstTable,
+    opts: &ScanOptions,
+    doc: &mut WeaveDocument,
+) -> anyhow::Result<()> {
+    let module = python::extract_task_decls_with(source, module_path, table)?;
     // CLI-supplied FQN defaults fill any part the file's own configure() left unset,
     // so raw DAGs (no tw.configure) still expand bare table names to full FQNs.
     let mut config = module.config;
@@ -1498,6 +1578,111 @@ def f():
         );
         // The job still exists (it is annotated), just with no self-edge.
         assert_eq!(doc.jobs.len(), 1);
+    }
+
+    #[test]
+    fn cross_file_constant_resolves_to_declared_high_confidence() {
+        // The real target layout: URIs centralized in config/datasets.py and
+        // consumed by services/x.py via `from config.datasets import ...`. The
+        // constant must resolve to its literal so the edge + datasets stay
+        // DECLARED / high confidence — NOT drop to inferred/medium.
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("trace_weaver_scan_test_xfile");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("config")).unwrap();
+        std::fs::create_dir_all(dir.join("services")).unwrap();
+        let mut cfg = std::fs::File::create(dir.join("config/datasets.py")).unwrap();
+        write!(
+            cfg,
+            r#"
+RAW_SALES = "s3://acme-raw/sales/events.parquet"
+BRONZE_SALES = "iceberg://warehouse.sales.bronze"
+"#
+        )
+        .unwrap();
+        let mut svc = std::fs::File::create(dir.join("services/ingest.py")).unwrap();
+        write!(
+            svc,
+            r#"
+from trace_weaver import lineage
+from config.datasets import RAW_SALES, BRONZE_SALES
+
+@lineage(inputs=[RAW_SALES], outputs=[BRONZE_SALES])
+def ingest_sales():
+    ...
+"#
+        )
+        .unwrap();
+        let doc = scan_path(&dir, &opts()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The literals from the OTHER file became the dataset names.
+        assert!(doc.dataset("s3://acme-raw/sales/events.parquet").is_some());
+        assert!(doc.dataset("iceberg://warehouse.sales.bronze").is_some());
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert_eq!(edge.from, "s3://acme-raw/sales/events.parquet");
+        assert_eq!(edge.to, "iceberg://warehouse.sales.bronze");
+        assert!(
+            !edge.origin.is_inferred(),
+            "cross-file constant edge must be DECLARED, got {:?}",
+            edge.origin
+        );
+        assert!(
+            doc.datasets.iter().all(|d| !d.origin.is_inferred()),
+            "cross-file constant datasets must be declared/high"
+        );
+        // No medium/non-literal fallback fired.
+        let codes: Vec<&str> = doc.diagnostics.iter().map(|d| d.code.as_str()).collect();
+        assert!(!codes.contains(&"W_NON_LITERAL"), "{codes:?}");
+    }
+
+    #[test]
+    fn cross_file_self_loop_from_constant_emits_declared_self_edge() {
+        // A declared @lineage self-loop whose single endpoint is a cross-file
+        // constant resolves to one DECLARED self-edge (regression: constants must
+        // behave exactly like inline literals, including for self-loops).
+        use std::io::Write;
+        let dir = std::env::temp_dir().join("trace_weaver_scan_test_xfile_selfloop");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = std::fs::File::create(dir.join("datasets.py")).unwrap();
+        writeln!(cfg, "PREFIX = \"s3://bucket/prefix\"").unwrap();
+        let mut svc = std::fs::File::create(dir.join("dag.py")).unwrap();
+        write!(
+            svc,
+            r#"
+from trace_weaver import lineage
+from datasets import PREFIX
+
+@lineage(inputs=[PREFIX], outputs=[PREFIX], description="delete orphans in place")
+def dedupe():
+    ...
+"#
+        )
+        .unwrap();
+        let doc = scan_path(&dir, &opts()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(doc.edges.len(), 1, "exactly one self-edge");
+        let e = &doc.edges[0];
+        assert_eq!(e.from, "s3://bucket/prefix");
+        assert_eq!(e.to, "s3://bucket/prefix");
+        assert!(!e.origin.is_inferred(), "declared self-edge from constant");
+    }
+
+    #[test]
+    fn module_path_of_derives_dotted_paths() {
+        use std::path::Path;
+        let root = Path::new("/repo/dags");
+        assert_eq!(
+            module_path_of(root, Path::new("/repo/dags/config/datasets.py")),
+            "config.datasets"
+        );
+        assert_eq!(module_path_of(root, Path::new("/repo/dags/dag.py")), "dag");
+        assert_eq!(
+            module_path_of(root, Path::new("/repo/dags/pkg/__init__.py")),
+            "pkg"
+        );
     }
 
     #[test]
