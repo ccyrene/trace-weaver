@@ -3,6 +3,54 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
+## 0.6.0
+
+### Added
+
+- **Column-edge attribution.** Pass C (column/dataflow discovery) traces
+  undecorated, un-wired top-level functions purely for column lineage — but
+  when such a function's synthetic frame names ("`raw_staging`", "`tw_tmpl`",
+  a temp-view name) carry no job, no file/line, no relationship to the real
+  dataset URIs a co-located `@lineage`/`@tw.task` declaration names, exporters
+  and downstream tooling had nothing to join the two on and dropped the
+  mapping. Two changes close this gap:
+  - **Full attribution.** When a Pass-C function is called *directly* (a plain
+    top-level `helper(df)` call — not `python_callable=`, which Pass B already
+    claims) from the body of a declared task, its column mappings are now
+    resolved onto that task's REAL declared edge instead of a synthetic frame:
+    unambiguous when the caller declares exactly one input and one output
+    (the synthetic frame names are simply irrelevant then), or when the
+    analyzer named a table that matches exactly one of several declared
+    endpoints by its final FQN segment. The synthetic frame dataset/edge is
+    then never emitted for that flow. Column entries keep
+    `origin.source = "inferred_code"` and their confidence — only their
+    *placement* becomes declared-anchored; they gain an `origin.location`
+    (file/line) pointing at the callee's actual code.
+  - **Minimum viable provenance (fallback).** Whatever isn't attributed —
+    because no static caller exists at all (the dominant real-world shape: a
+    `SparkSubmitOperator` / `importlib`-dispatched transform module, invisible
+    to static analysis by construction), or because the caller declares
+    several inputs AND several outputs with no name match to pair against —
+    now carries `origin.location` (`file`, `line`) on both the synthetic frame
+    dataset and the column-discovery edge, plus `job` (the caller's task id)
+    whenever a caller was found even without a resolvable pairing. Pass B's
+    decorator-free task discovery gets the same `origin.location` stamp on its
+    structural dataset/edge origins. All additive to `Origin` — deserializes
+    fine against documents written before this field existed, and
+    `weave_version` stays `"0.1"`.
+
+  On the reference central-repo corpus every one of the 122 column-discovery
+  edges keeps its current shape: none of them are reachable from a declared
+  task via a static call (the dispatch is `SparkSubmitOperator` +
+  `transform_master.py`'s runtime module resolution, per
+  `dii/services/warehouse/spark.py`'s own review note) — so full attribution
+  correctly declines to guess anywhere on that repo, while still adding
+  file/line to all 122 edges and their synthetic frame datasets. The feature
+  is exercised by dedicated fixtures instead: a single-input/single-output
+  declared task calling a helper directly (full attribution), and a
+  multi-input/multi-output declared task calling a helper whose frame name
+  doesn't match any declared endpoint (ambiguous → fallback with `job` set).
+
 ## 0.5.1
 
 ### Fixed

@@ -76,6 +76,16 @@ pub struct TaskDecl {
     /// mappings. Such a decl contributes datasets + column-carrying edges but
     /// **no job**, so it never enters the gate's task denominator.
     pub column_only: bool,
+    /// For a `column_only` (Pass C) decl: the name of a declared (`@lineage` /
+    /// `@tw.task`) task in the SAME module whose body directly calls this
+    /// function — the static single-hop call-graph link column-edge
+    /// attribution needs to resolve this callee's synthetic frames to the
+    /// caller's REAL declared datasets. `None` when no such caller was found
+    /// (e.g. the function is dispatched dynamically at runtime, as with the
+    /// `importlib`-resolved transform protocol), in which case the callee's
+    /// column mappings stay on synthetic frame datasets (Option B: file/line
+    /// provenance only, no job).
+    pub enclosing_task: Option<String>,
 }
 
 /// Per-file defaults from a module-level `tw.configure(...)` call and/or a
@@ -472,6 +482,17 @@ pub fn extract_task_decls_with(
         }
     }
 
+    // Column-edge attribution: a single-hop static call-graph link from a
+    // declared (`@lineage`/`@tw.task`) task's body to another top-level
+    // function it calls directly (not via `python_callable=`, which Pass B
+    // already claims). When a Pass-C candidate is reached this way, its
+    // column mappings can be resolved to the CALLER's real declared datasets
+    // instead of staying on synthetic frame datasets — see `scan_decl` /
+    // `scan_column_discovery` in `lib.rs` for the resolution/pairing rules.
+    // Only tasks that declared at least one real input AND output can anchor
+    // an attribution (nothing to resolve a synthetic frame to, otherwise).
+    let enclosing_of = enclosing_callers(&suite, &tasks, &decorated, &funcs);
+
     // Pass B: decorator-FREE discovery from raw Airflow operators. A plain DAG with
     // no `@tw` still yields lineage: PythonOperator(python_callable=fn) analyzes the
     // callable's body, and SQL operators (sql=/query=) parse their query. A `@tw`
@@ -486,9 +507,134 @@ pub fn extract_task_decls_with(
     // gate's task denominator (a machine-inferred column map, not a task).
     let mut claimed = decorated.clone();
     collect_python_callables(&suite, &mut claimed);
-    discover_dataflow_columns(&suite, source, &consts, &claimed, &mut tasks);
+    discover_dataflow_columns(&suite, source, &consts, &claimed, &enclosing_of, &mut tasks);
 
     Ok(ScannedModule { config, tasks })
+}
+
+/// For every Pass-A task that declared at least one literal input AND output,
+/// find the top-level functions its body calls DIRECTLY (a plain `helper(df)`
+/// call — not `python_callable=helper`, which is Pass B's own linking
+/// mechanism). Returns `callee name -> caller task name`. When a callee is
+/// (implausibly) called by more than one declared task, the first one found
+/// wins — attribution then still resolves the ambiguity per-column against
+/// that single caller; multi-caller fan-in is rare enough not to warrant a
+/// `Vec` here, and the existing per-column pairing rules already fall back to
+/// Option B (synthetic frame, `job` stamped) for anything they can't resolve.
+fn enclosing_callers(
+    suite: &[Stmt],
+    tasks: &[TaskDecl],
+    decorated: &std::collections::HashSet<String>,
+    funcs: &HashMap<&str, &ast::StmtFunctionDef>,
+) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    for stmt in suite {
+        let func = match stmt {
+            Stmt::FunctionDef(f) => f,
+            _ => continue,
+        };
+        if !decorated.contains(func.name.as_str()) {
+            continue;
+        }
+        let Some(decl) = tasks.iter().find(|t| t.task_name == func.name.as_str()) else {
+            continue;
+        };
+        if decl.inputs.is_empty() || decl.outputs.is_empty() {
+            continue; // nothing to resolve a callee's synthetic frame to
+        }
+        let mut called = std::collections::HashSet::new();
+        collect_call_names(&func.body, &mut called);
+        for callee in called {
+            if callee == func.name.as_str() || !funcs.contains_key(callee.as_str()) {
+                continue;
+            }
+            out.entry(callee).or_insert_with(|| func.name.to_string());
+        }
+    }
+    out
+}
+
+/// Recursively collect every bare-name callee (`f(...)`) reachable from
+/// `stmts` — a much shallower pass than [`crate::dataflow::analyze`]: it does
+/// not trace dataflow, only "does this code call function X anywhere".
+fn collect_call_names(stmts: &[Stmt], out: &mut std::collections::HashSet<String>) {
+    fn visit_expr(e: &Expr, out: &mut std::collections::HashSet<String>) {
+        if let Expr::Call(c) = e {
+            if let Expr::Name(n) = c.func.as_ref() {
+                out.insert(n.id.to_string());
+            }
+            visit_expr(&c.func, out);
+            for a in &c.args {
+                visit_expr(a, out);
+            }
+            for kw in &c.keywords {
+                visit_expr(&kw.value, out);
+            }
+            return;
+        }
+        match e {
+            Expr::BinOp(b) => {
+                visit_expr(&b.left, out);
+                visit_expr(&b.right, out);
+            }
+            Expr::BoolOp(b) => b.values.iter().for_each(|v| visit_expr(v, out)),
+            Expr::UnaryOp(u) => visit_expr(&u.operand, out),
+            Expr::Compare(c) => {
+                visit_expr(&c.left, out);
+                c.comparators.iter().for_each(|v| visit_expr(v, out));
+            }
+            Expr::IfExp(i) => {
+                visit_expr(&i.test, out);
+                visit_expr(&i.body, out);
+                visit_expr(&i.orelse, out);
+            }
+            Expr::Attribute(a) => visit_expr(&a.value, out),
+            Expr::Subscript(s) => {
+                visit_expr(&s.value, out);
+                visit_expr(&s.slice, out);
+            }
+            Expr::Starred(s) => visit_expr(&s.value, out),
+            Expr::NamedExpr(n) => visit_expr(&n.value, out),
+            Expr::Await(a) => visit_expr(&a.value, out),
+            Expr::Tuple(t) => t.elts.iter().for_each(|v| visit_expr(v, out)),
+            Expr::List(l) => l.elts.iter().for_each(|v| visit_expr(v, out)),
+            Expr::Set(s) => s.elts.iter().for_each(|v| visit_expr(v, out)),
+            Expr::Dict(d) => {
+                d.keys.iter().flatten().for_each(|v| visit_expr(v, out));
+                d.values.iter().for_each(|v| visit_expr(v, out));
+            }
+            _ => {}
+        }
+    }
+    for stmt in stmts {
+        match stmt {
+            Stmt::Assign(a) => visit_expr(&a.value, out),
+            Stmt::AugAssign(a) => visit_expr(&a.value, out),
+            Stmt::AnnAssign(a) => {
+                if let Some(v) = &a.value {
+                    visit_expr(v, out);
+                }
+            }
+            Stmt::Expr(e) => visit_expr(&e.value, out),
+            Stmt::Return(r) => {
+                if let Some(v) = &r.value {
+                    visit_expr(v, out);
+                }
+            }
+            Stmt::With(w) => collect_call_names(&w.body, out),
+            Stmt::If(i) => {
+                collect_call_names(&i.body, out);
+                collect_call_names(&i.orelse, out);
+            }
+            Stmt::For(f) => collect_call_names(&f.body, out),
+            Stmt::While(w) => collect_call_names(&w.body, out),
+            Stmt::Try(t) => {
+                collect_call_names(&t.body, out);
+                collect_call_names(&t.finalbody, out);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Collect every function name bound to a `python_callable=<Name>` on any
@@ -539,6 +685,7 @@ fn discover_dataflow_columns(
     source: &str,
     consts: &HashMap<String, String>,
     claimed: &std::collections::HashSet<String>,
+    enclosing_of: &HashMap<String, String>,
     tasks: &mut Vec<TaskDecl>,
 ) {
     for stmt in suite {
@@ -563,6 +710,11 @@ fn discover_dataflow_columns(
             line: Some(byte_to_line(source, func.range().start().to_usize())),
             discovered: true,
             column_only: true,
+            // The declared task (if any, in this same module) whose body calls
+            // this function directly — column-edge attribution's join key back
+            // to a REAL dataset edge. `None` when nothing statically calls it
+            // (e.g. runtime `importlib` dispatch), which keeps today's behavior.
+            enclosing_task: enclosing_of.get(name).cloned(),
             // Opaque notes are intentionally dropped: these are discovery
             // targets, not authored tasks, so "declare this column" advisories
             // would be noise and would perturb diagnostic counts.

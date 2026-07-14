@@ -24,8 +24,8 @@
 use std::path::Path;
 
 use trace_weaver_core::{
-    ColumnEdge, ColumnRef, Dataset, Diagnostic, Edge, Engine, FqnParts, Job, Origin, SourceLoc,
-    Transform, TransformType, WeaveDocument,
+    ColumnEdge, ColumnRef, Dataset, DatasetRef, Diagnostic, Edge, Engine, FqnParts, Job, Origin,
+    SourceLoc, Transform, TransformType, WeaveDocument,
 };
 
 use crate::python::{ColumnMapEntry, ModuleConfig, TaskDecl};
@@ -398,7 +398,7 @@ fn scan_decl(
     // the IR never claims a discovered task was hand-declared; a `@tw` task keeps
     // declared. (Column-level origin is set independently per mapping below.)
     let element_origin = if decl.discovered {
-        discovered_origin(engine)
+        discovered_origin(engine).with_location(loc.clone())
     } else if decl.lineage {
         // A @lineage task is hand-declared, but tagged so exporters/finalize can
         // tell it apart as declarative dataset-level lineage.
@@ -584,10 +584,22 @@ fn scan_decl(
 /// was traced purely for column lineage (e.g. the `run(spark, …)` transform
 /// protocol; a `spark.sql(f"INSERT … SELECT CAST(…) FROM view")`).
 ///
-/// Deliberately side-effect-light: it emits **no job** (so the gate task
-/// denominator is unchanged), no hygiene diagnostics, and no `W_OPAQUE_COLUMN`
-/// advisories. Every element it does emit is inferred (never declared/HIGH), and
-/// an edge is only pushed when it actually carries a column mapping.
+/// **Column-edge attribution (v0.6):** when `decl.enclosing_task` names a
+/// declared task in the same module whose body calls this function directly,
+/// each column mapping is first offered to [`attribute_to_declared_job`],
+/// which resolves it onto that task's REAL declared edge whenever the target
+/// (and source) dataset is unambiguous — see that function for the pairing
+/// rules. Anything attributed this way needs no synthetic frame dataset or
+/// edge at all. Only the leftover (no caller found, or genuinely ambiguous —
+/// e.g. several declared inputs AND outputs with no name match) falls through
+/// to the synthetic-frame path below, which now also stamps `job` (when a
+/// caller is known) and `origin.location` (file/line) — so even the
+/// unattributed remainder carries real provenance instead of none at all.
+///
+/// Deliberately side-effect-light otherwise: no hygiene diagnostics, no
+/// `W_OPAQUE_COLUMN` advisories. Every element it emits is inferred (never
+/// declared/HIGH), and a synthetic edge is only pushed when it actually
+/// carries a column mapping.
 fn scan_column_discovery(
     path: &str,
     decl: &TaskDecl,
@@ -608,13 +620,66 @@ fn scan_column_discovery(
     if inputs.is_empty() || outputs.is_empty() {
         return;
     }
-    let _loc = SourceLoc::new(path, decl.line); // kept for parity / future use
-    let element_origin = discovered_origin(engine);
+    let loc = SourceLoc::new(path, decl.line);
+    let element_origin = discovered_origin(engine).with_location(loc.clone());
+
+    // The declared task (if any) that calls this function directly. Looked up
+    // by name against jobs already scanned earlier in this same file — Pass A
+    // runs before Pass C, so the caller's job (if it produced one) is already
+    // in `doc.jobs` by the time its callees reach this point.
+    let caller_job: Option<Job> = decl
+        .enclosing_task
+        .as_ref()
+        .and_then(|name| doc.jobs.iter().rev().find(|j| &j.name == name))
+        .cloned();
+
+    let (attributed, leftover) = match &caller_job {
+        Some(job) if !job.inputs.is_empty() && !job.outputs.is_empty() => {
+            attribute_to_declared_job(&decl.inferred_columns, job, &loc)
+        }
+        _ => (Vec::new(), decl.inferred_columns.clone()),
+    };
+
+    for (real_in, real_out, ce) in attributed {
+        let job_id = caller_job.as_ref().map(|j| j.id.clone());
+        let idx = doc
+            .edges
+            .iter()
+            .position(|e| e.from == real_in && e.to == real_out && e.job == job_id);
+        let idx = idx.unwrap_or_else(|| {
+            // The caller's own `scan_decl` normally already created this edge
+            // (one per input×output pair); this branch only guards against an
+            // endpoint pairing `scan_decl` itself skips (e.g. a declared
+            // self-loop edge case), so the mapping is never silently dropped.
+            let mut e = Edge::new(real_in.clone(), real_out.clone());
+            e.job = job_id.clone();
+            if let Some(j) = &caller_job {
+                e.origin = j.origin.clone();
+            }
+            doc.edges.push(e);
+            doc.edges.len() - 1
+        });
+        doc.edges[idx].column_lineage.push(ce);
+    }
+
+    if leftover.is_empty() {
+        // Every column mapping landed on the caller's real declared edge — the
+        // synthetic frame datasets/edges this function would otherwise need
+        // are no longer necessary.
+        return;
+    }
 
     for ds_name in inputs.iter().chain(outputs.iter()) {
         doc.upsert_dataset(build_dataset(ds_name, &element_origin));
     }
 
+    // Re-point at the leftover columns only — anything attributed above must
+    // not ALSO be emitted on a synthetic frame edge.
+    let mut decl_leftover = decl.clone();
+    decl_leftover.inferred_columns = leftover;
+    let decl = &decl_leftover;
+
+    let job_id = caller_job.as_ref().map(|j| j.id.clone());
     let default_input = inputs.first().cloned();
     let single_output = outputs.len() == 1;
     for output in &outputs {
@@ -644,6 +709,10 @@ fn scan_column_discovery(
                 sql: None,
             };
             edge.origin = element_origin.clone();
+            // `job` is set only when we know WHICH declared task's body called
+            // this function — the pairing itself stayed ambiguous (otherwise it
+            // would have been attributed above), but the caller is not.
+            edge.job = job_id.clone();
             // Mark this as a column-discovery (Pass C) edge so the gate measures
             // it in the column dimension, not the task/declared edge ratio.
             edge.column_discovery = true;
@@ -662,6 +731,63 @@ fn scan_column_discovery(
             }
         }
     }
+}
+
+/// Resolve a Pass-C callee's column mappings onto a declared caller's REAL
+/// dataset edges (column-edge attribution, v0.6). For each column: the target
+/// is unambiguous when the caller declared exactly one output, or when the
+/// analyzer named a table (`output_table`, from `to_sql`/`saveAsTable`/a SQL
+/// `INSERT`) that matches exactly one of several declared outputs by its final
+/// FQN segment. Everything else — no caller-declared output at all, or several
+/// outputs with no name match — is genuinely ambiguous and returned as
+/// `leftover` for the synthetic-frame fallback (Option B) instead of guessed.
+///
+/// Once the target is resolved, the mapping is built exactly like an
+/// already-declared task's own body dataflow (`inferred_code_column_edge`),
+/// which already fans a mapping out to every declared INPUT its sources
+/// reference by name, defaulting an unqualified source to the caller's first
+/// input — the same tolerance a hand-declared multi-input task gets today.
+fn attribute_to_declared_job(
+    columns: &[crate::dataflow::InferredColumn],
+    job: &Job,
+    loc: &SourceLoc,
+) -> (
+    Vec<(DatasetRef, DatasetRef, ColumnEdge)>,
+    Vec<crate::dataflow::InferredColumn>,
+) {
+    let single_output = job.outputs.len() == 1;
+    let mut placed = Vec::new();
+    let mut leftover = Vec::new();
+    for c in columns {
+        let real_output = match &c.output_table {
+            Some(t) => match_input_by_table(t, &job.outputs)
+                .or_else(|| single_output.then(|| job.outputs[0].clone())),
+            None if single_output => Some(job.outputs[0].clone()),
+            None => None,
+        };
+        let Some(real_output) = real_output else {
+            leftover.push(c.clone());
+            continue;
+        };
+
+        let default_input = job.inputs[0].clone();
+        let mut ce = inferred_code_column_edge(c, &default_input, &real_output, &job.inputs);
+        ce.origin = ce.origin.with_location(loc.clone());
+
+        let referenced: Vec<&DatasetRef> = job
+            .inputs
+            .iter()
+            .filter(|inp| ce.from_columns.iter().any(|fc| &fc.dataset == *inp))
+            .collect();
+        if referenced.is_empty() {
+            placed.push((default_input, real_output, ce));
+        } else {
+            for inp in referenced {
+                placed.push((inp.clone(), real_output.clone(), ce.clone()));
+            }
+        }
+    }
+    (placed, leftover)
 }
 
 /// Emit hygiene diagnostics for one declaration. `inputs`/`outputs` are the
@@ -1841,6 +1967,219 @@ def run(spark, src_path, database, table, first_run, job_id, load_date_str, targ
             .find(|c| c.to_column.column == "WEIGHT")
             .expect("WEIGHT mapping");
         assert_eq!(w.transform_type, TransformType::Identity);
+    }
+
+    #[test]
+    fn column_edge_attribution_single_in_single_out_lands_on_declared_edge() {
+        // Goal A (v0.6 column-edge attribution): a declared @lineage task calls a
+        // plain (undecorated, un-wired) helper directly — the exact "lives inside
+        // (or is called from)" shape. The helper's own read/rename/write produces
+        // synthetic frame names ("sometable" / "unrelated_temp") that name NEITHER
+        // of the caller's real datasets, but since the caller declares exactly one
+        // input and one output the pairing is unambiguous: every column mapping
+        // must land directly on the caller's REAL declared edge, and no synthetic
+        // frame dataset/edge should be emitted at all.
+        let src = r#"
+from traceweaver import lineage
+import pandas as pd
+
+def _clean(src_path):
+    df = pd.read_sql("SELECT * FROM sometable", con=E)
+    df = df.rename(columns={"case_code": "case_id", "amount": "amount_thb"})
+    df.to_sql("unrelated_temp")
+
+@lineage(
+    inputs=["postgresql://conn/aoc.raw_mule"],
+    outputs=["postgresql://conn/aoc.temp_mule_trend"],
+)
+def load_data_from_parquet_to_temp_table(src_path):
+    _clean(src_path)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("etl.py", src, &opts(), &mut doc).unwrap();
+
+        assert_eq!(doc.jobs.len(), 1, "the callee gets no job of its own");
+        assert_eq!(
+            doc.edges.len(),
+            1,
+            "fully attributed — no synthetic frame edge, got {:?}",
+            doc.edges
+                .iter()
+                .map(|e| (e.from.clone(), e.to.clone()))
+                .collect::<Vec<_>>()
+        );
+        // No synthetic frame datasets ("sometable" / "unrelated_temp") leaked in.
+        assert_eq!(doc.datasets.len(), 2);
+        assert!(doc.dataset("sometable").is_none());
+        assert!(doc.dataset("unrelated_temp").is_none());
+
+        let edge = &doc.edges[0];
+        assert_eq!(edge.from, "postgresql://conn/aoc.raw_mule");
+        assert_eq!(edge.to, "postgresql://conn/aoc.temp_mule_trend");
+        assert!(!edge.origin.is_inferred(), "declared edge stays declared");
+        assert!(!edge.column_discovery);
+
+        let case_id = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "case_id")
+            .expect("case_id must attach to the declared edge");
+        assert_eq!(
+            case_id.to_column.dataset,
+            "postgresql://conn/aoc.temp_mule_trend"
+        );
+        assert_eq!(case_id.from_columns[0].column, "case_code");
+        assert_eq!(
+            case_id.from_columns[0].dataset,
+            "postgresql://conn/aoc.raw_mule"
+        );
+        assert_eq!(case_id.origin.source, OriginSource::InferredCode);
+        // Provenance points at the callee's actual code, not the caller's.
+        let loc = case_id.origin.location.as_ref().expect("location set");
+        assert_eq!(loc.file, "etl.py");
+        assert!(loc.line.is_some());
+
+        let amount = edge
+            .column_lineage
+            .iter()
+            .find(|c| c.to_column.column == "amount_thb")
+            .expect("amount_thb must attach to the declared edge too");
+        assert_eq!(amount.from_columns[0].column, "amount");
+    }
+
+    #[test]
+    fn column_edge_attribution_falls_back_when_ambiguous() {
+        // A declared task with SEVERAL inputs AND outputs calls a helper whose
+        // synthetic output frame name matches none of them by name — the pairing
+        // is genuinely ambiguous, so Goal A must decline to guess and fall back to
+        // Option B: the mapping stays on a synthetic column-discovery edge, but
+        // now stamped with the caller's job id and file/line provenance (we DO
+        // know which task's body called it, even though we can't tell which of
+        // its several declared outputs the flow belongs to).
+        let src = r#"
+from traceweaver import lineage
+import pandas as pd
+
+def _merge(a_path, b_path):
+    df = pd.read_sql("SELECT * FROM sometable", con=E)
+    df = df.rename(columns={"a": "b"})
+    df.to_sql("unrelated_temp")
+
+@lineage(
+    inputs=["s3://bucket/one", "s3://bucket/two"],
+    outputs=["s3://bucket/three", "s3://bucket/four"],
+)
+def multi_task(a_path, b_path):
+    _merge(a_path, b_path)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("multi.py", src, &opts(), &mut doc).unwrap();
+
+        assert_eq!(doc.jobs.len(), 1);
+        let job_id = doc.jobs[0].id.clone();
+
+        let cd_edge = doc
+            .edges
+            .iter()
+            .find(|e| e.column_discovery)
+            .expect("ambiguous mapping falls back to a synthetic column-discovery edge");
+        assert_eq!(cd_edge.from, "sometable");
+        assert_eq!(cd_edge.to, "unrelated_temp");
+        // Option B: the caller is known even though the pairing wasn't, so `job`
+        // and `origin.location` are populated where today they'd be empty.
+        assert_eq!(cd_edge.job, Some(job_id));
+        let loc = cd_edge.origin.location.as_ref().expect("location set");
+        assert_eq!(loc.file, "multi.py");
+        assert!(loc.line.is_some());
+        assert!(!cd_edge.column_lineage.is_empty());
+
+        // None of the caller's real declared edges got a mapping — the ambiguity
+        // was never guessed away onto one of them.
+        for e in doc.edges.iter().filter(|e| !e.column_discovery) {
+            assert!(
+                e.column_lineage.is_empty(),
+                "declared edge {} -> {} must not receive a guessed mapping",
+                e.from,
+                e.to
+            );
+        }
+    }
+
+    #[test]
+    fn pass_c_without_a_static_caller_behaves_as_before_but_gains_provenance() {
+        // Minimum viable (Option B), the un-annotated case: a Pass-C function with
+        // NO static caller anywhere (the real-world shape — dynamic importlib
+        // dispatch) must behave exactly as before (same job/edge/dataset shape,
+        // still no `job`) but now carries `origin.location` (file/line) on both
+        // the synthetic frame dataset and the column-discovery edge.
+        let src = r#"
+import pandas as pd
+def run(src_path):
+    df = pd.read_sql("SELECT * FROM sometable", con=E)
+    df = df.rename(columns={"a": "b"})
+    df.to_sql("unrelated_temp")
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("standalone.py", src, &opts(), &mut doc).unwrap();
+
+        assert!(doc.jobs.is_empty(), "still no job — column discovery only");
+        assert_eq!(doc.edges.len(), 1);
+        let edge = &doc.edges[0];
+        assert!(edge.column_discovery);
+        assert_eq!(
+            edge.job, None,
+            "no static caller was found — job stays unset"
+        );
+        let edge_loc = edge.origin.location.as_ref().expect("edge location set");
+        assert_eq!(edge_loc.file, "standalone.py");
+        assert!(edge_loc.line.is_some());
+
+        let ds = doc
+            .dataset("sometable")
+            .expect("synthetic frame dataset kept");
+        let ds_loc = ds.origin.location.as_ref().expect("dataset location set");
+        assert_eq!(ds_loc.file, "standalone.py");
+        assert!(ds_loc.line.is_some());
+    }
+
+    #[test]
+    fn pass_b_discovered_task_gains_file_line_provenance() {
+        // Minimum viable (Option B) for decorator-free discovery (Pass B): a raw
+        // Airflow operator's structural elements were already stamped inferred —
+        // they now ALSO carry origin.location (file/line), same as Pass C.
+        let src = r#"
+from airflow import DAG
+BRONZE_SQL = "INSERT INTO bronze_sales (event_id) SELECT raw_id FROM landing_sales"
+def build_silver():
+    bronze = pd.read_sql("SELECT * FROM bronze_sales", con=E)
+    silver = pd.DataFrame()
+    silver["amount_usd"] = bronze["amount"] * 1.08
+    silver.to_sql("silver_sales", con=E)
+with DAG("medallion") as dag:
+    bronze = PostgresOperator(task_id="bronze", sql=BRONZE_SQL)
+    silver = PythonOperator(task_id="silver", python_callable=build_silver)
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("dag_raw.py", src, &opts(), &mut doc).unwrap();
+
+        assert!(!doc.edges.is_empty());
+        for e in &doc.edges {
+            let loc = e
+                .origin
+                .location
+                .as_ref()
+                .unwrap_or_else(|| panic!("edge {} -> {} missing location", e.from, e.to));
+            assert_eq!(loc.file, "dag_raw.py");
+            assert!(loc.line.is_some());
+        }
+        for d in &doc.datasets {
+            let loc = d
+                .origin
+                .location
+                .as_ref()
+                .unwrap_or_else(|| panic!("dataset {} missing location", d.name));
+            assert_eq!(loc.file, "dag_raw.py");
+        }
     }
 
     #[test]

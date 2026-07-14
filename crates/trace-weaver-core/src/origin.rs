@@ -17,6 +17,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::model::SourceLoc;
+
 /// Where a piece of lineage knowledge originated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -56,6 +58,13 @@ pub struct Origin {
     /// Free-text explanation, e.g. which analyzer produced the inference.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Where in source this fact was recovered from, e.g. the transform
+    /// function's file/line for a machine-inferred dataset, edge, or
+    /// column-discovery edge. `None` when unknown (declared facts don't need
+    /// one — the decorator itself is the provenance). Additive field: absent
+    /// from documents written before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<SourceLoc>,
 }
 
 impl Origin {
@@ -65,6 +74,7 @@ impl Origin {
             source: OriginSource::Declared,
             confidence: None,
             note: None,
+            location: None,
         }
     }
 
@@ -74,6 +84,7 @@ impl Origin {
             source: OriginSource::InferredSql,
             confidence: Some(confidence),
             note: None,
+            location: None,
         }
     }
 
@@ -83,11 +94,18 @@ impl Origin {
             source: OriginSource::InferredCode,
             confidence: Some(confidence),
             note: None,
+            location: None,
         }
     }
 
     pub fn with_note(mut self, note: impl Into<String>) -> Self {
         self.note = Some(note.into());
+        self
+    }
+
+    /// Stamp the source file/line this fact was recovered from.
+    pub fn with_location(mut self, loc: SourceLoc) -> Self {
+        self.location = Some(loc);
         self
     }
 
