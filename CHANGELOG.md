@@ -3,7 +3,7 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
-## Unreleased
+## 0.6.1
 
 ### Fixed
 
