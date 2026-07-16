@@ -223,6 +223,14 @@ fn finalize(doc: &mut WeaveDocument, opts: &ScanOptions) {
 
 /// Merge the columns observed on edges into each dataset's `schema`, so the
 /// document records known columns and `validate()`'s column checks become live.
+///
+/// Column-discovery (Pass C) edges are excluded: their `from`/`to` are often a
+/// synthetic frame name (`tw_tmpl`, a bare temp-view like `raw_staging`) that
+/// many unrelated functions across the corpus coincidentally share. Backfilling
+/// from them would union every such function's columns onto one shared dataset,
+/// which `code_inference_pass` below would then hand back to every edge that
+/// name touches — fabricating cross-file column lineage. A real dataset's
+/// schema still gets backfilled from every task/declared edge that names it.
 fn backfill_schemas(doc: &mut WeaveDocument) {
     use std::collections::BTreeMap;
     let mut cols: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -232,7 +240,7 @@ fn backfill_schemas(doc: &mut WeaveDocument) {
             v.push(col.to_string());
         }
     };
-    for e in &doc.edges {
+    for e in doc.edges.iter().filter(|e| !e.column_discovery) {
         for ce in &e.column_lineage {
             note(&ce.to_column.dataset, &ce.to_column.column, &mut cols);
             for fc in &ce.from_columns {
@@ -253,13 +261,19 @@ fn backfill_schemas(doc: &mut WeaveDocument) {
 
 /// Best-effort identity gap-fill (origin = inferred_code) for output columns that
 /// share a name with an input column but weren't mapped on that edge.
+///
+/// Skips column-discovery (Pass C) edges for the same reason `backfill_schemas`
+/// excludes them from the union above: their endpoints are often a synthetic
+/// frame name shared by many unrelated functions, so gap-filling from the
+/// (corpus-wide) dataset schema would hand each of them every other function's
+/// columns instead of just its own.
 fn code_inference_pass(doc: &mut WeaveDocument) {
     let datasets: std::collections::HashMap<String, Dataset> = doc
         .datasets
         .iter()
         .map(|d| (d.name.clone(), d.clone()))
         .collect();
-    for edge in &mut doc.edges {
+    for edge in doc.edges.iter_mut().filter(|e| !e.column_discovery) {
         let already: Vec<String> = edge
             .column_lineage
             .iter()
@@ -1970,6 +1984,63 @@ def run(spark, src_path, database, table, first_run, job_id, load_date_str, targ
     }
 
     #[test]
+    fn column_discovery_leftover_edges_do_not_cross_pollinate_across_files() {
+        // Two unrelated files whose Pass-C `run()` both fall back to the same
+        // generic synthetic frame names — a bare temp-view called "raw_staging"
+        // (a common real-world convention, not a trace-weaver artifact) and
+        // dataflow's SQL_TEMPLATE_PLACEHOLDER "tw_tmpl" (used when the output
+        // table name is an unresolvable f-string). Scanning them together must
+        // not let file B's real columns leak onto file A's edge (or vice versa)
+        // via backfill_schemas/code_inference_pass's corpus-wide, name-keyed
+        // dataset schema — the real bug behind the "~1000 cols/edge" symptom.
+        let src_a = r#"
+def run(spark, database, table):
+    df = spark.read.format("csv").load("x")
+    full_table_name = f"glue_cat.{database}.{table}"
+    df.createOrReplaceTempView("raw_staging")
+    spark.sql(f"INSERT INTO {full_table_name} SELECT PERSONAL_ID, INCOME FROM raw_staging")
+"#;
+        let src_b = r#"
+def run(spark, database, table):
+    df = spark.read.format("csv").load("y")
+    full_table_name = f"glue_cat.{database}.{table}"
+    df.createOrReplaceTempView("raw_staging")
+    spark.sql(f"INSERT INTO {full_table_name} SELECT TOURIST_COUNT, PARK_NAME FROM raw_staging")
+"#;
+        let mut doc = WeaveDocument::new("ns", "test");
+        scan_source("mol_dsd/a.py", src_a, &opts(), &mut doc).unwrap();
+        scan_source("tourism/b.py", src_b, &opts(), &mut doc).unwrap();
+        finalize(&mut doc, &opts());
+
+        let synthetic: Vec<_> = doc
+            .edges
+            .iter()
+            .filter(|e| e.from == "raw_staging" && e.to == "tw_tmpl")
+            .collect();
+        assert_eq!(
+            synthetic.len(),
+            2,
+            "one synthetic leftover edge per file, never merged: {:?}",
+            synthetic
+        );
+
+        for e in &synthetic {
+            let cols: std::collections::BTreeSet<&str> = e
+                .column_lineage
+                .iter()
+                .map(|c| c.to_column.column.as_str())
+                .collect();
+            let is_a = cols == ["PERSONAL_ID", "INCOME"].into_iter().collect();
+            let is_b = cols == ["TOURIST_COUNT", "PARK_NAME"].into_iter().collect();
+            assert!(
+                is_a || is_b,
+                "edge must carry ONLY its own file's columns, not the other file's: {:?}",
+                cols
+            );
+        }
+    }
+
+    #[test]
     fn column_edge_attribution_single_in_single_out_lands_on_declared_edge() {
         // Goal A (v0.6 column-edge attribution): a declared @lineage task calls a
         // plain (undecorated, un-wired) helper directly — the exact "lives inside
@@ -2163,7 +2234,7 @@ with DAG("medallion") as dag:
         scan_source("dag_raw.py", src, &opts(), &mut doc).unwrap();
 
         assert!(!doc.edges.is_empty());
-        for e in &doc.edges {
+        for e in doc.edges.iter().filter(|e| !e.column_discovery) {
             let loc = e
                 .origin
                 .location

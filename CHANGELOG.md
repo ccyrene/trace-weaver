@@ -3,6 +3,42 @@
 All notable changes to `trace-weaver` (the Rust CLI and the `trace_weaver`
 Python authoring SDK, which share one version number) are documented here.
 
+## Unreleased
+
+### Fixed
+
+- **Column-discovery schema pollution across unrelated files (the real "~1000
+  cols/edge" cause).** `finalize()`'s `backfill_schemas` + `code_inference_pass`
+  union columns onto a dataset's schema and gap-fill identity mappings back
+  from it, keyed purely by dataset *name*. Pass C's synthetic leftover frame
+  names — `tw_tmpl` (the hardcoded template placeholder) and common, coincidentally-
+  reused temp-view names like `raw_staging` — are not unique per function, so
+  this silently unioned every unrelated function's columns that happened to
+  share one of these generic names into one shared schema, then handed that
+  union back to every edge touching the name. Verified live against the DII
+  pilot repo: a single, unbranched 12-column file's own edge carried 1088
+  entries, including columns from completely unrelated ministries (confirmed
+  by isolating the file: scanned alone it correctly reports 12; scanned with
+  the rest of the corpus, 1088). `backfill_schemas` and `code_inference_pass`
+  now skip `column_discovery` edges, so a real dataset's schema still gets
+  backfilled from every task/declared edge that names it, but Pass C's
+  synthetic frames never contribute to (or draw from) that corpus-wide pool.
+  Repo-wide, this dropped `column_mappings` from 99,633 to 2,052 with zero
+  change to `dataset`/`declared-edge`/`annotated-job`/`module-column-coverage`
+  (verified via the central repo's ref-diff no-loss integration test) — the
+  99,631 difference was 100% fabricated, none of it real coverage.
+- **Multi-branch column duplication (the smaller, real half of the same
+  symptom).** `Analyzer::finish()` deduped `outputs` but never `columns`, and
+  `stmt()`'s `Stmt::If` arm walks both `body` and `orelse` unconditionally
+  (`elif` chains nest inside `orelse`), so a mapping re-derived byte-for-byte
+  in several mutually-exclusive branches (the real shape in
+  `mot_ops/public_transport_fare_assistance.py`'s 5-branch dispatch) was
+  pushed once per branch. `columns` is now deduped by full field equality
+  (after `output_table` is stamped) — a true duplicate (same sources, same
+  target, same producing expression) collapses to one; two branches that
+  merely share a target column but differ in source or expression (a literal
+  fill vs. a real rename) still both survive as distinct entries.
+
 ## 0.6.0
 
 ### Added
@@ -87,14 +123,19 @@ Python authoring SDK, which share one version number) are documented here.
 
 ### Known limitations
 
-- **Multi-branch column over-generation (targeted for v0.6).** When a
-  column-discovery function fans a single dataset→dataset edge out across many
-  output branches, the analyzer can attach an inflated column-mapping set to
-  that edge (observed on the order of ~1000 mappings per edge on some central
-  modules). This does not affect the gate's task/declared metrics — such edges
-  are counted only in the report-only `column_mappings` dimension — but it
-  inflates that count and downstream column-lineage exports. A precise
-  per-branch attribution fix is deferred to v0.6.
+- ~~**Multi-branch column over-generation (targeted for v0.6).**~~ **Fixed, see
+  Unreleased above.** The actual mechanism turned out to be broader than this
+  entry described: it was corpus-wide schema pollution across unrelated files
+  sharing a generic synthetic frame name (`backfill_schemas`/
+  `code_inference_pass`), not merely branch fan-out within one edge — a real
+  intra-function branch-duplication bug existed too, but was the smaller
+  contributor. Original text, for the record: "When a column-discovery
+  function fans a single dataset→dataset edge out across many output
+  branches, the analyzer can attach an inflated column-mapping set to that
+  edge (observed on the order of ~1000 mappings per edge on some central
+  modules). This does not affect the gate's task/declared metrics — such
+  edges are counted only in the report-only `column_mappings` dimension —
+  but it inflates that count and downstream column-lineage exports."
 
 ## 0.5.0
 

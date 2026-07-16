@@ -1301,15 +1301,23 @@ impl<'a> Analyzer<'a> {
         outputs.extend(sql_outputs);
         outputs.sort();
         outputs.dedup();
-        let cols = columns
-            .into_iter()
-            .map(|(owner, mut c)| {
-                if let Some(t) = writes.get(&owner) {
-                    c.output_table = t.clone();
-                }
-                c
-            })
-            .collect();
+        // Mutually exclusive branches (if/elif/else) are walked unconditionally
+        // (see `stmt()`'s `Stmt::If` arm), so a mapping re-derived byte-for-byte
+        // in several branches would otherwise be pushed once per branch. Dedupe
+        // by full equality (after `output_table` is stamped) so only a true
+        // duplicate — same sources, same target, same producing expression —
+        // collapses; two branches that merely share a target column (e.g. one
+        // fills it with a literal, another renames a real source into it) keep
+        // their own distinct entries.
+        let mut cols: Vec<InferredColumn> = Vec::with_capacity(columns.len());
+        for (owner, mut c) in columns {
+            if let Some(t) = writes.get(&owner) {
+                c.output_table = t.clone();
+            }
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
         let engine = if saw_spark {
             Some("spark".to_string())
         } else if saw_pandas {
@@ -1864,5 +1872,85 @@ def run(spark, database):
 "#;
         let r = run(src);
         assert!(r.columns.is_empty(), "no columns from DDL: {:?}", r.columns);
+    }
+
+    #[test]
+    fn identical_mapping_in_every_branch_collapses_to_one() {
+        // `stmt()`'s `Stmt::If` arm walks both `body` and `orelse` unconditionally,
+        // so an if/elif/elif/else chain that maps the same column the same way in
+        // every branch (the real shape in
+        // dags/dii/transforms/mot_ops/public_transport_fare_assistance.py, each
+        // branch building a fresh `wh_df` off the same `stg_df`) must not multiply
+        // that one real fact by the number of branches.
+        let src = r#"
+def run(spark, is_srt, is_bmta, is_tcl, is_srtet):
+    stg_df = spark.read.table("bronze")
+    if is_srt:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    elif is_bmta:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    elif is_tcl:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    elif is_srtet:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    wh_df.write.saveAsTable("warehouse")
+"#;
+        let r = run(src);
+        let matches: Vec<_> = r
+            .columns
+            .iter()
+            .filter(|c| c.target == "station_name")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            1,
+            "4 byte-identical branch renames must collapse to 1: {:?}",
+            r.columns
+        );
+        assert_eq!(matches[0].sources, vec!["bronze.SRC_NAME".to_string()]);
+    }
+
+    #[test]
+    fn distinct_mapping_sharing_a_target_with_other_branches_is_kept() {
+        // Same shape as above, but one branch renames a DIFFERENT real source
+        // column into the target — a genuinely distinct fact that must survive
+        // dedup alongside the (collapsed) matching branches.
+        let src = r#"
+def run(spark, is_srt, is_mrta, is_bmta):
+    stg_df = spark.read.table("bronze")
+    if is_srt:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    elif is_mrta:
+        wh_df = stg_df.withColumnRenamed("สถานี", "station_name")
+    elif is_bmta:
+        wh_df = stg_df.withColumnRenamed("SRC_NAME", "station_name")
+    wh_df.write.saveAsTable("warehouse")
+"#;
+        let r = run(src);
+        let matches: Vec<_> = r
+            .columns
+            .iter()
+            .filter(|c| c.target == "station_name")
+            .collect();
+        assert_eq!(
+            matches.len(),
+            2,
+            "the SRC_NAME rename (x2, collapsed to 1) and the สถานี rename must both survive, distinctly: {:?}",
+            r.columns
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|c| c.sources == vec!["bronze.SRC_NAME".to_string()]),
+            "the SRC_NAME rename should survive: {:?}",
+            matches
+        );
+        assert!(
+            matches
+                .iter()
+                .any(|c| c.sources == vec!["bronze.สถานี".to_string()]),
+            "the สถานี rename should survive: {:?}",
+            matches
+        );
     }
 }
