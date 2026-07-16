@@ -17,6 +17,9 @@ __pycache__/
 .venv/
 dist/
 
+# Local secrets (Docker Hub token for manual publish testing)
+.env
+
 # Editor / OS
 .DS_Store
 *.swp
